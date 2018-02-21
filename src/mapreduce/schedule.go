@@ -42,25 +42,26 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
 	}()
 
 	var wg sync.WaitGroup
-	for i := 0; i < ntasks; i ++ {
-		wg.Add(1)
-		taskNumber := i
-		 go func() {
-			 for {
-				 w := <-availableChan
-				 file := mapFiles[taskNumber % len(mapFiles)]
-				 args := DoTaskArgs{jobName, file, phase, taskNumber, n_other}
-				 ok := call(w, "Worker.DoTask", args, nil)
-				 if ok == true {
-				 	wg.Done()
-				 	availableChan <- w
-				 	break
-				 } else {
-				 	continue
-				 }
-			 }
-		 }()
-	}
+	wg.Add(ntasks)
+	go func() {
+		for n := 0; n < ntasks; n ++ {
+			go func(taskNumber int) {
+				for {
+					w := <-availableChan
+					file := mapFiles[taskNumber % len(mapFiles)]
+					args := DoTaskArgs{jobName, file, phase, taskNumber, n_other}
+					ok := call(w, "Worker.DoTask", args, nil)
+					if ok == true {
+						wg.Done()
+						availableChan <- w
+						break
+					} else {
+						continue
+					}
+				}
+			}(n)
+		}
+	}()
 	wg.Wait()
 
 	fmt.Printf("Schedule: %v done\n", phase)
