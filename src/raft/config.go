@@ -13,7 +13,9 @@ import "log"
 import "sync"
 import "testing"
 import "runtime"
+import "math/rand"
 import crand "crypto/rand"
+import "math/big"
 import "encoding/base64"
 import "sync/atomic"
 import "time"
@@ -24,6 +26,13 @@ func randstring(n int) string {
 	crand.Read(b)
 	s := base64.URLEncoding.EncodeToString(b)
 	return s[0:n]
+}
+
+func makeSeed() int64 {
+	max := big.NewInt(int64(1) << 62)
+	bigx, _ := crand.Int(crand.Reader, max)
+	x := bigx.Int64()
+	return x
 }
 
 type config struct {
@@ -53,6 +62,7 @@ func make_config(t *testing.T, n int, unreliable bool) *config {
 		if runtime.NumCPU() < 2 {
 			fmt.Printf("warning: only one CPU, which may conceal locking bugs\n")
 		}
+		rand.Seed(makeSeed())
 	})
 	runtime.GOMAXPROCS(4)
 	cfg := &config{}
@@ -479,10 +489,12 @@ func (cfg *config) end() {
 	atomic.AddInt32(&cfg.testNum, 1) // suppress two-minute timeout
 
 	if cfg.t.Failed() == false {
+		cfg.mu.Lock()
 		t := time.Since(cfg.t0).Seconds()     // real time
 		npeers := cfg.n                       // number of Raft peers
 		nrpc := cfg.rpcTotal() - cfg.rpcs0    // number of RPC sends
 		ncmds := cfg.maxIndex - cfg.maxIndex0 // number of Raft agreements reported
+		cfg.mu.Unlock()
 
 		fmt.Printf("  ... Passed --")
 		fmt.Printf("  %4.1f  %d %4d %4d\n", t, npeers, nrpc, ncmds)
