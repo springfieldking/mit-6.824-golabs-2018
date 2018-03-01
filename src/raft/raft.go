@@ -170,17 +170,27 @@ type AppendEntriesReply  struct {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-
+	// recieve AppendEntries req
+	rf.doLock()
+	rf.handleMsg(MsgAppendEntriesReq, args, reply)
+	rf.doUnlock()
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	if ok {
+		// recieve AppendEntries res
+		rf.doLock()
+		rf.handleMsg(MsgAppendEntriesRes, args, reply)
+		rf.doUnlock()
+	}
 	return ok
 }
 
 // bcastAppend sends RRPC, with entries to all peers that are not up-to-date
 // according to the progress recorded in r.prs.
 func (rf *Raft) bcastAppendEntries() {
+	rf.assertLockHeld("need locked before call bcastAppendEntries!")
 	//lastLogIndex, lastLogTerm := rf.getLastLog()
 	currentTerm := rf.currentTerm
 
@@ -192,9 +202,7 @@ func (rf *Raft) bcastAppendEntries() {
 			go func(peer int) {
 				args := AppendEntriesArgs{Term:currentTerm, LeaderId:rf.me}
 				reply := AppendEntriesReply{}
-				if ok := rf.sendAppendEntries(peer, &args, &reply); ok {
-
-				}
+				rf.sendAppendEntries(peer, &args, &reply)
 			}(p)
 		}
 	}()
@@ -202,6 +210,7 @@ func (rf *Raft) bcastAppendEntries() {
 
 // bcastHeartbeat sends RRPC, without entries to all the peers.
 func (rf *Raft) bcastHeartbeat() {
+	rf.assertLockHeld("need locked before call bcastHeartbeat!")
 	//lastLogIndex, lastLogTerm := rf.getLastLog()
 	currentTerm := rf.currentTerm
 
@@ -213,9 +222,7 @@ func (rf *Raft) bcastHeartbeat() {
 			go func(peer int) {
 				args := AppendEntriesArgs{Term:currentTerm, LeaderId:rf.me}
 				reply := AppendEntriesReply{}
-				if ok := rf.sendAppendEntries(peer, &args, &reply); ok {
-
-				}
+				rf.sendAppendEntries(peer, &args, &reply)
 			}(p)
 		}
 	}()
@@ -249,7 +256,10 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-
+	// recieve AppendEntries req
+	rf.doLock()
+	rf.handleMsg(MsgRequestVoteReq, args, reply)
+	rf.doUnlock()
 }
 
 //
@@ -283,10 +293,17 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	if ok {
+		// recieve AppendEntries res
+		rf.doLock()
+		rf.handleMsg(MsgRequestVoteRes, args, reply)
+		rf.doUnlock()
+	}
 	return ok
 }
 
 func (rf *Raft) bcastRequestVote() {
+	rf.assertLockHeld("need locked before call bcastRequestVote!")
 
 	go func() {
 		for p := range rf.peers {
@@ -296,9 +313,7 @@ func (rf *Raft) bcastRequestVote() {
 			go func(peer int) {
 				args := AppendEntriesArgs{}
 				reply := AppendEntriesReply{}
-				if ok := rf.sendAppendEntries(peer, &args, &reply); ok {
-
-				}
+				rf.sendAppendEntries(peer, &args, &reply)
 			}(p)
 		}
 	}()
@@ -380,31 +395,32 @@ func (rf *Raft) doUnlock() {
 	rf.mu.Unlock()
 }
 
-func (rf *Raft) isLocked() bool {
-	return rf.isLock == true
+func (rf * Raft) assertLockHeld(v interface{})  {
+	if !rf.isLock {
+		panic(v)
+	}
 }
 
 type MsgType uint32
 const (
-	AppendEntries 	MsgType = iota
-	RequestVote
+	MsgAppendEntriesReq MsgType = iota
+	MsgRequestVoteReq
+	MsgAppendEntriesRes
+	MsgRequestVoteRes
 )
 
 type EventType uint32
 const (
-	EventAppendEntries            EventType = iota // AppendEntries or HeartBeats
-	EventRequestVote
-	EventFollowerElectionTimeout
+
+	EventFollowerElectionTimeout EventType = iota
 	EventCandidateElectionTimeout
 	EventLeaderHeartbeatTimeout
 	EventShutDown
 )
 
 type StateEventHandler 	func (EventType)
-type StateMsgHandler 	func (MsgType, *struct{}, *struct{})
+type StateMsgHandler 	func (MsgType, interface{}, interface{})
 type StateChange 		func ()
-
-var globalRandSeedInitFlag int32 = 0
 
 //
 // create a background, a state mashine loop
@@ -461,23 +477,17 @@ func (rf *Raft) background() {
 }
 
 func (rf *Raft) handleEvent(event EventType)  {
-	if !rf.isLocked() {
-		panic("need locked before call handleEvent!")
-	}
+	rf.assertLockHeld("need locked before call handleEvent!")
 	rf.eventHandlers[rf.currState](event)
 }
 
-func (rf *Raft) handleMsg(msg MsgType, args *struct{}, reply *struct{})  {
-	if !rf.isLocked() {
-		panic("need locked before call handleMsg!")
-	}
+func (rf *Raft) handleMsg(msg MsgType, args interface{}, reply interface{})  {
+	rf.assertLockHeld("need locked before call handleMsg!")
 	rf.msgHandlers[rf.currState](msg, args, reply)
 }
 
 func (rf *Raft) become(state StateType)  {
-	if !rf.isLocked() {
-		panic("need locked before call become!")
-	}
+	rf.assertLockHeld("need locked before call become!")
 	rf.currState = state
 	rf.changeHandlers[rf.currState]()
 }
@@ -492,9 +502,6 @@ func (rf *Raft) followerEventHandler(event EventType)  {
 	// If election timeout elapses without receiving AppendEntries
 	// RPC from current leader or granting vote to candidate: convert to candidate
 	switch event {
-	case EventAppendEntries, EventRequestVote:
-		DPrintf("raft = ", rf.me, " state = ", rf.currState, " got event = ", event, " do become(StateFollower)")
-		rf.become(StateFollower)
 	case EventFollowerElectionTimeout:
 		DPrintf("raft = ", rf.me, " state = ", rf.currState, " got event = ", event, " do become(StateCandidate)")
 		rf.become(StateCandidate)
@@ -503,7 +510,7 @@ func (rf *Raft) followerEventHandler(event EventType)  {
 	}
 }
 
-func (rf *Raft) followerMsgHandler(msg MsgType, args *struct{}, reply *struct{})  {
+func (rf *Raft) followerMsgHandler(msg MsgType, args interface{}, reply interface{})  {
 
 }
 
@@ -530,9 +537,6 @@ func (rf *Raft) candidateEventHandler(event EventType)  {
 	// If AppendEntries RPC received from new leader: convert to follower
 	// If election timeout elapses: start new election
 	switch event {
-	case EventAppendEntries:
-		DPrintf("raft = ", rf.me, " state = ", rf.currState, " got event = ", event, " do become(StateFollower)")
-		rf.become(StateFollower)
 	case EventCandidateElectionTimeout:
 		DPrintf("raft = ", rf.me, " state = ", rf.currState, " got event = ", event, " do become(StateCandidate)")
 		rf.become(StateCandidate)
@@ -541,7 +545,7 @@ func (rf *Raft) candidateEventHandler(event EventType)  {
 	}
 }
 
-func (rf *Raft) candidateMsgHandler(msg MsgType, args *struct{}, reply *struct{})  {
+func (rf *Raft) candidateMsgHandler(msg MsgType, args interface{}, reply interface{})  {
 
 }
 
@@ -563,6 +567,6 @@ func (rf *Raft) leaderEventHandler(event EventType)  {
 	}
 }
 
-func (rf *Raft) leaderMsgHandler(msg MsgType, args *struct{}, reply *struct{})  {
+func (rf *Raft) leaderMsgHandler(msg MsgType, args interface{}, reply interface{})  {
 
 }
