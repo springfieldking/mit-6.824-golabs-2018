@@ -55,6 +55,7 @@ type ApplyMsg struct {
 }
 
 type LogEntry struct {
+	index 	int 			// index
 	term 	int				// when entry was received by leader
 	command interface{}		// command for state machine
 }
@@ -93,9 +94,8 @@ type Raft struct {
 	// timer
 	timers 				[]*time.Timer
 	// state func
-	eventHandlers  		[]StateEventHandler
-	msgHandlers    		[]StateMsgHandler
-	changeHandlers 		[]StateChange
+	steps          		[]StateStep
+	changes 			[]StateChange
 	// rand
 	rand                *rand.Rand
 	// lockSate
@@ -160,7 +160,7 @@ type AppendEntriesArgs struct {
 	LeaderId		int 			// so follower can redirect clients
 	PrevLogIndex 	int 			// index of log entry immediately preceding new ones
 	PrevLogTerm 	int 			// term of prevLogIndex entry
-	Entries			[]interface{} 	// log entries to store (empty for heartbeat; may send more than one for efficiency)
+	Entries			[]LogEntry 		// log entries to store (empty for heartbeat; may send more than one for efficiency)
 	LeaderCommit	int 			// leader’s commitIndex
 }
 
@@ -172,7 +172,7 @@ type AppendEntriesReply  struct {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	// recieve AppendEntries req
 	rf.doLock()
-	rf.handleMsg(MsgAppendEntriesReq, args, reply)
+	rf.handleAEMsg(args, reply)
 	rf.doUnlock()
 }
 
@@ -181,7 +181,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	if ok {
 		// recieve AppendEntries res
 		rf.doLock()
-		rf.handleMsg(MsgAppendEntriesRes, args, reply)
+		rf.step(EventData{event:EventAppendEntriesRes, success:reply.Success, term:reply.Term})
 		rf.doUnlock()
 	}
 	return ok
@@ -191,8 +191,9 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // according to the progress recorded in r.prs.
 func (rf *Raft) bcastAppendEntries() {
 	rf.assertLockHeld("need locked before call bcastAppendEntries!")
-	//lastLogIndex, lastLogTerm := rf.getLastLog()
-	currentTerm := rf.currentTerm
+	term := rf.currentTerm
+	leaderId := rf.me
+	leaderCommit := rf.commitIndex
 
 	go func() {
 		for p := range rf.peers {
@@ -200,7 +201,7 @@ func (rf *Raft) bcastAppendEntries() {
 				continue
 			}
 			go func(peer int) {
-				args := AppendEntriesArgs{Term:currentTerm, LeaderId:rf.me}
+				args := AppendEntriesArgs{Term:term, LeaderId:leaderId, LeaderCommit:leaderCommit}
 				reply := AppendEntriesReply{}
 				rf.sendAppendEntries(peer, &args, &reply)
 			}(p)
@@ -211,8 +212,9 @@ func (rf *Raft) bcastAppendEntries() {
 // bcastHeartbeat sends RRPC, without entries to all the peers.
 func (rf *Raft) bcastHeartbeat() {
 	rf.assertLockHeld("need locked before call bcastHeartbeat!")
-	//lastLogIndex, lastLogTerm := rf.getLastLog()
-	currentTerm := rf.currentTerm
+	term := rf.currentTerm
+	leaderId := rf.me
+	leaderCommit := rf.commitIndex
 
 	go func() {
 		for p := range rf.peers {
@@ -220,7 +222,7 @@ func (rf *Raft) bcastHeartbeat() {
 				continue
 			}
 			go func(peer int) {
-				args := AppendEntriesArgs{Term:currentTerm, LeaderId:rf.me}
+				args := AppendEntriesArgs{Term:term, LeaderId:leaderId, LeaderCommit:leaderCommit}
 				reply := AppendEntriesReply{}
 				rf.sendAppendEntries(peer, &args, &reply)
 			}(p)
@@ -258,7 +260,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	// recieve AppendEntries req
 	rf.doLock()
-	rf.handleMsg(MsgRequestVoteReq, args, reply)
+	rf.handleRVMsg(args, reply)
 	rf.doUnlock()
 }
 
@@ -296,7 +298,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	if ok {
 		// recieve AppendEntries res
 		rf.doLock()
-		rf.handleMsg(MsgRequestVoteRes, args, reply)
+		rf.step(EventData{event:EventRequestVoteRes, success:reply.voteGranted, term:reply.Term})
 		rf.doUnlock()
 	}
 	return ok
@@ -374,7 +376,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (2A, 2B, 2C).
 	rf.currentTerm = 0
 	rf.votedFor = -1
-	rf.log = append(rf.log, LogEntry{term:0})
+	rf.log = append(rf.log, LogEntry{index:1, term:1})
 	go rf.background()
 
 	// initialize from state persisted before a crash
@@ -383,7 +385,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	return rf
 }
-
 
 func (rf *Raft) doLock() {
 	rf.mu.Lock()
@@ -401,25 +402,26 @@ func (rf * Raft) assertLockHeld(v interface{})  {
 	}
 }
 
-type MsgType uint32
-const (
-	MsgAppendEntriesReq MsgType = iota
-	MsgRequestVoteReq
-	MsgAppendEntriesRes
-	MsgRequestVoteRes
-)
-
 type EventType uint32
 const (
-
 	EventFollowerElectionTimeout EventType = iota
 	EventCandidateElectionTimeout
 	EventLeaderHeartbeatTimeout
+	EventAppendEntriesReq
+	EventAppendEntriesRes
+	EventRequestVoteReq
+	EventRequestVoteRes
 	EventShutDown
 )
 
-type StateEventHandler 	func (EventType)
-type StateMsgHandler 	func (MsgType, interface{}, interface{})
+type EventData struct {
+	event 	EventType
+
+	term	int
+	success bool
+}
+
+type StateStep 			func (EventData)
 type StateChange 		func ()
 
 //
@@ -454,9 +456,8 @@ func (rf *Raft) background() {
 	}()
 
 	// init state handler
-	rf.eventHandlers = []StateEventHandler{rf.followerEventHandler, rf.candidateEventHandler, rf.leaderEventHandler}
-	rf.msgHandlers = []StateMsgHandler{rf.followerMsgHandler, rf.candidateMsgHandler, rf.leaderMsgHandler}
-	rf.changeHandlers = []StateChange{rf.followerChange, rf.candidateChange, rf.leaderChange}
+	rf.steps = []StateStep{rf.followerStep, rf.candidateStep, rf.leaderStep}
+	rf.changes = []StateChange{rf.followerChange, rf.candidateChange, rf.leaderChange}
 
 	// init state
 	rf.doLock()
@@ -471,47 +472,51 @@ func (rf *Raft) background() {
 		}
 
 		rf.doLock()
-		rf.handleEvent(event)
+		rf.step(EventData{event:event})
 		rf.doUnlock()
 	}
 }
 
-func (rf *Raft) handleEvent(event EventType)  {
+func (rf *Raft) step(eventdata EventData)  {
 	rf.assertLockHeld("need locked before call handleEvent!")
-	rf.eventHandlers[rf.currState](event)
-}
-
-func (rf *Raft) handleMsg(msg MsgType, args interface{}, reply interface{})  {
-	rf.assertLockHeld("need locked before call handleMsg!")
-	rf.msgHandlers[rf.currState](msg, args, reply)
+	rf.steps[rf.currState](eventdata)
 }
 
 func (rf *Raft) become(state StateType)  {
 	rf.assertLockHeld("need locked before call become!")
 	rf.currState = state
-	rf.changeHandlers[rf.currState]()
+	rf.changes[rf.currState]()
 }
 
 const ElectionTimeOut = 300
-
-func (rf *Raft) followerChange()  {
-	rf.timers[StateFollower].Reset(time.Duration(rand.Intn(ElectionTimeOut) +ElectionTimeOut) * time.Millisecond)
-}
-
-func (rf *Raft) followerEventHandler(event EventType)  {
-	// If election timeout elapses without receiving AppendEntries
-	// RPC from current leader or granting vote to candidate: convert to candidate
-	switch event {
-	case EventFollowerElectionTimeout:
-		DPrintf("raft = ", rf.me, " state = ", rf.currState, " got event = ", event, " do become(StateCandidate)")
-		rf.become(StateCandidate)
-	default:
-		DPrintf("raft = ", rf.me, " state = ", rf.currState, " got event = ", event, " Unexpected, do nothing")
+func (rf *Raft) resetTimer()  {
+	switch rf.currState {
+	case StateFollower:
+		rf.timers[StateFollower].Reset(time.Duration(rand.Intn(ElectionTimeOut) +ElectionTimeOut) * time.Millisecond)
+	case StateCandidate:
+		rf.timers[StateCandidate].Reset(time.Duration(rand.Intn(ElectionTimeOut) +ElectionTimeOut) * time.Millisecond)
+	case StateLeader:
+		rf.timers[StateLeader].Reset(time.Duration(ElectionTimeOut) * time.Millisecond)
 	}
 }
 
-func (rf *Raft) followerMsgHandler(msg MsgType, args interface{}, reply interface{})  {
+func (rf *Raft) followerChange()  {
+	rf.resetTimer()
+}
 
+func (rf *Raft) followerStep(eventdata EventData)  {
+	// If election timeout elapses without receiving AppendEntries
+	// RPC from current leader or granting vote to candidate: convert to candidate
+	switch eventdata.event {
+	case EventAppendEntriesReq:
+		rf.resetTimer()
+	case EventRequestVoteReq:
+		rf.resetTimer()
+	case EventFollowerElectionTimeout:
+		rf.become(StateCandidate)
+	default:
+		DPrintf("raft = ", rf.me, " state = ", rf.currState, " got event = ", eventdata.event, " Unexpected, do nothing")
+	}
 }
 
 func (rf *Raft) getLastLog() (int, int) {
@@ -527,46 +532,157 @@ func (rf *Raft) candidateChange()  {
 	// reset voteCount
 	rf.voteCount = 0
 	// reset election timer
-	rf.timers[StateCandidate].Reset(time.Duration(rand.Intn(ElectionTimeOut) +ElectionTimeOut) * time.Millisecond)
+	rf.resetTimer();
 
 	// send RequestVote RPCs to all other servers
 	rf.bcastRequestVote()
 }
 
-func (rf *Raft) candidateEventHandler(event EventType)  {
-	// If AppendEntries RPC received from new leader: convert to follower
-	// If election timeout elapses: start new election
-	switch event {
+func (rf *Raft) candidateStep(eventdata EventData)  {
+	switch eventdata.event {
 	case EventCandidateElectionTimeout:
-		DPrintf("raft = ", rf.me, " state = ", rf.currState, " got event = ", event, " do become(StateCandidate)")
+		// If election timeout elapses: start new election
 		rf.become(StateCandidate)
+	case EventAppendEntriesReq:
+		// If AppendEntries RPC received from new leader: convert to follower
+		rf.become(StateFollower)
+	case EventAppendEntriesRes:
+		// If votes received from majority of servers: become leader
+		rf.voteCount ++
+		if rf.voteCount > len(rf.peers) / 2 {
+			rf.become(StateLeader)
+		}
 	default:
-		DPrintf("raft = ", rf.me, " state = ", rf.currState, " got event = ", event, " Unexpected, do nothing")
+		DPrintf("raft = ", rf.me, " state = ", rf.currState, " got event = ", eventdata.event, " Unexpected, do nothing")
 	}
-}
-
-func (rf *Raft) candidateMsgHandler(msg MsgType, args interface{}, reply interface{})  {
-
 }
 
 func (rf *Raft) leaderChange()  {
 	// reset timer
-	rf.timers[StateLeader].Reset(time.Duration(ElectionTimeOut) * time.Millisecond)
+	rf.resetTimer();
 
-	// send initial empty AppendEntries RPCs (heartbeat) to each server
+	// Reinitialized after election
+	rf.nextIndex = []int{}
+	rf.matchIndex = []int{}
+
+	// Upon election: send initial empty AppendEntries RPCs
+	// (heartbeat) to each server; repeat during idle periods to
+	// prevent election timeouts
 	rf.bcastHeartbeat()
 }
 
-func (rf *Raft) leaderEventHandler(event EventType)  {
-	switch event {
+func (rf *Raft) leaderStep(eventdata EventData)  {
+	switch eventdata.event {
 	case EventLeaderHeartbeatTimeout:
-		DPrintf("raft = ", rf.me, " state = ", rf.currState, " got event = ", event, " do become(StateLeader)")
-		rf.become(StateLeader)
+		rf.resetTimer();
 	default:
-		DPrintf("raft = ", rf.me, " state = ", rf.currState, " got event = ", event, " Unexpected, do nothing")
+		DPrintf("raft = ", rf.me, " state = ", rf.currState, " got event = ", eventdata.event, " Unexpected, do nothing")
 	}
 }
 
-func (rf *Raft) leaderMsgHandler(msg MsgType, args interface{}, reply interface{})  {
+func (rf *Raft) handleAEMsg(args *AppendEntriesArgs, reply *AppendEntriesReply)  {
+	defer rf.step(EventData{event:EventAppendEntriesReq, term:args.Term})
 
+	// init
+	reply.Success = true
+	reply.Term = rf.currentTerm
+
+	//  Reply false if term < currentTerm
+	if args.Term < rf.currentTerm {
+		reply.Success = false
+		return
+	}
+
+	// Reply false if log doesn’t contain an entry at prevLogIndex
+	// whose term matches prevLogTerm
+	if len(rf.log) < args.PrevLogIndex {
+		reply.Success = false
+		return
+	} else {
+		index := args.PrevLogIndex - 1
+		if rf.log[index].term != args.PrevLogTerm {
+			reply.Success = false
+			return
+		}
+	}
+
+	// If an existing entry conflicts with a new one (same index
+	// but different terms), delete the existing entry and all that
+	// follow it
+	// Append any new entries not already in the log
+	for _, entry := range args.Entries {
+		index := entry.index
+		if len(rf.log) >= index {
+			if rf.log[index - 1].term == entry.term {
+				// do nothing
+			} else {
+				// delete the existing entry and all that follow it
+				rf.log = rf.log[:index - 1]
+			}
+		}
+
+		if len(rf.log) < index {
+			rf.log = append(rf.log, entry)
+		}
+	}
+
+	// check local log index order
+	for i := 0; i < len(rf.log); i ++ {
+		if rf.log[i].index != i + 1 {
+			panic("log index order error")
+		}
+	}
+
+	// If leaderCommit > commitIndex, set commitIndex =
+	// min(leaderCommit, index of last new entry)
+	if args.LeaderCommit > rf.commitIndex {
+		if args.LeaderCommit < len(rf.log) {
+			rf.commitIndex = args.LeaderCommit
+		} else {
+			rf.commitIndex = len(rf.log)
+		}
+	}
+
+	// If commitIndex > lastApplied: increment lastApplied, apply
+	// log[lastApplied] to state machine
+	if rf.commitIndex > rf.lastApplied {
+		rf.commitIndex = rf.lastApplied
+	}
 }
+
+func (rf *Raft) handleRVMsg(args *RequestVoteArgs, reply *RequestVoteReply)  {
+	defer rf.step(EventData{event:EventRequestVoteReq, term:args.Term})
+
+	// init
+	reply.voteGranted = false
+	reply.Term = rf.currentTerm
+
+	// Reply false if term < currentTerm
+	if args.Term < rf.currentTerm {
+		reply.voteGranted = false
+		reply.Term = rf.currentTerm
+		return
+	}
+
+	// If votedFor is null or candidateId, and candidate’s log is at
+	// least as up-to-date as receiver’s log, grant vote
+
+	// If the logs have last entries with different terms, then
+	// the log with the later term is more up-to-date. If the logs
+	// end with the same term, then whichever log is longer is
+	// more up-to-date.
+	if rf.votedFor < 0 || rf.votedFor == args.CandidateId {
+		entry := rf.log[len(rf.log)]
+
+		if args.LastLogTerm > entry.term {
+			reply.voteGranted = true
+		}
+
+		if args.LastLogTerm == entry.term {
+			if args.LastLogIndex >= entry.index {
+				reply.voteGranted = true
+			}
+		}
+	}
+}
+
