@@ -477,6 +477,8 @@ func (rf *Raft) background() {
 	}
 }
 
+func (rf *Raft) q() int { return len(rf.peers)/2 + 1 }
+
 func (rf *Raft) step(eventdata EventData)  {
 	rf.assertLockHeld("need locked before call handleEvent!")
 	rf.steps[rf.currState](eventdata)
@@ -519,11 +521,6 @@ func (rf *Raft) followerStep(eventdata EventData)  {
 	}
 }
 
-func (rf *Raft) getLastLog() (int, int) {
-	len := len(rf.log)
-	return len, rf.log[len - 1].term
-}
-
 func (rf *Raft) candidateChange()  {
 	// increment currentTerm
 	rf.currentTerm ++
@@ -546,10 +543,10 @@ func (rf *Raft) candidateStep(eventdata EventData)  {
 	case EventAppendEntriesReq:
 		// If AppendEntries RPC received from new leader: convert to follower
 		rf.become(StateFollower)
-	case EventAppendEntriesRes:
+	case EventRequestVoteRes:
 		// If votes received from majority of servers: become leader
 		rf.voteCount ++
-		if rf.voteCount > len(rf.peers) / 2 {
+		if rf.voteCount >= rf.q() {
 			rf.become(StateLeader)
 		}
 	default:
