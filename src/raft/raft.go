@@ -501,13 +501,15 @@ func (rf *Raft) background() {
 
 	// timer watch
 	go func() {
-		select {
-		case <-rf.timers[StateFollower].C:
-			rf.chanEvent <- EventFollowerElectionTimeout
-		case <-rf.timers[StateCandidate].C:
-			rf.chanEvent <- EventCandidateElectionTimeout
-		case <-rf.timers[StateLeader].C:
-			rf.chanEvent <- EventLeaderHeartbeatTimeout
+		for {
+			select {
+			case <-rf.timers[StateFollower].C:
+				rf.chanEvent <- EventFollowerElectionTimeout
+			case <-rf.timers[StateCandidate].C:
+				rf.chanEvent <- EventCandidateElectionTimeout
+			case <-rf.timers[StateLeader].C:
+				rf.chanEvent <- EventLeaderHeartbeatTimeout
+			}
 		}
 	}()
 
@@ -520,7 +522,7 @@ func (rf *Raft) background() {
 
 	// init state
 	rf.doLock()
-	DPrintf("raft = %d, term = %d, state = %d, first init         \t\t become(StateFollower)!", rf.me, rf.currentTerm, rf.currState)
+	DPrintf("raft = %d, term = %d, state = %d, first init \t\t\t become(StateFollower)!", rf.me, rf.currentTerm, rf.currState)
 	rf.become(StateFollower)
 	rf.doUnlock()
 
@@ -539,6 +541,11 @@ func (rf *Raft) background() {
 
 func (rf *Raft) q() int { return len(rf.peers)/2 + 1 }
 
+func (rf *Raft) reset()  {
+	rf.votedFor = -1
+	rf.voteCount = 0
+}
+
 func (rf *Raft) step(event Event)  {
 	rf.assertLockHeld("need locked before call handleEvent!")
 	rf.steps[rf.currState](event)
@@ -546,7 +553,17 @@ func (rf *Raft) step(event Event)  {
 
 func (rf *Raft) become(state StateType)  {
 	rf.assertLockHeld("need locked before call become!")
+
+	if rf.currState == StateFollower && state == StateLeader {
+		panic("invalid transition [follower -> leader]")
+	}
+
+	if rf.currState == StateLeader && state == StateCandidate {
+		panic("invalid transition [leader -> candidate]")
+	}
+
 	rf.currState = state
+	rf.reset()
 	rf.becomes[rf.currState]()
 }
 
@@ -571,16 +588,16 @@ func (rf *Raft) stepFollower(event Event)  {
 	// RPC from current leader or granting vote to candidate: convert to candidate
 	switch event.event {
 	case EventAppendEntriesReq:
-		DPrintf("raft = %d, term = %d, state = %d, got event = %d     \t\t resetTimer!", rf.me, rf.currentTerm, rf.currState, event.event)
+		DPrintf("raft = %d, term = %d, state = %d, got event = %d \t\t resetTimer!", rf.me, rf.currentTerm, rf.currState, event.event)
 		rf.resetTimer()
 	case EventRequestVoteReq:
-		DPrintf("raft = %d, term = %d, state = %d, got event = %d     \t\t resetTimer!", rf.me, rf.currentTerm, rf.currState, event.event)
+		DPrintf("raft = %d, term = %d, state = %d, got event = %d \t\t resetTimer!", rf.me, rf.currentTerm, rf.currState, event.event)
 		rf.resetTimer()
 	case EventFollowerElectionTimeout:
-		DPrintf("raft = %d, term = %d, state = %d, got event = %d     \t\t become(StateCandidate)!", rf.me, rf.currentTerm, rf.currState, event.event)
+		DPrintf("raft = %d, term = %d, state = %d, got event = %d \t\t become(StateCandidate)!", rf.me, rf.currentTerm, rf.currState, event.event)
 		rf.become(StateCandidate)
 	default:
-		DPrintf("raft = %d, term = %d, state = %d, got event = %d     \t\t Unexpected do nothing!", rf.me, rf.currentTerm, rf.currState, event.event)
+		DPrintf("raft = %d, term = %d, state = %d, got event = %d \t\t Unexpected do nothing!", rf.me, rf.currentTerm, rf.currState, event.event)
 	}
 }
 
@@ -601,24 +618,24 @@ func (rf *Raft) becomeCandidate()  {
 func (rf *Raft) stepCandidate(event Event)  {
 	switch event.event {
 	case EventCandidateElectionTimeout:
-		DPrintf("raft = %d, term = %d, state = %d, got event = %d     \t\t become(StateCandidate)!", rf.me, rf.currentTerm, rf.currState, event.event)
+		DPrintf("raft = %d, term = %d, state = %d, got event = %d \t\t become(StateCandidate)!", rf.me, rf.currentTerm, rf.currState, event.event)
 		// If election timeout elapses: start new election
 		rf.become(StateCandidate)
 	case EventAppendEntriesReq:
-		DPrintf("raft = %d, term = %d, state = %d, got event = %d     \t\t become(StateFollower)!", rf.me, rf.currentTerm, rf.currState, event.event)
+		DPrintf("raft = %d, term = %d, state = %d, got event = %d \t\t become(StateFollower)!", rf.me, rf.currentTerm, rf.currState, event.event)
 		// If AppendEntries RPC received from new leader: convert to follower
 		rf.become(StateFollower)
 	case EventRequestVoteRes:
 		// If votes received from majority of servers: become leader
 		if event.success {
-			DPrintf("raft = %d, term = %d, state = %d, got event = %d     \t\t add vote!", rf.me, rf.currentTerm, rf.currState, event.event)
+			DPrintf("raft = %d, term = %d, state = %d, got event = %d \t\t add vote!", rf.me, rf.currentTerm, rf.currState, event.event)
 			rf.voteCount ++
 			if rf.voteCount >= rf.q() {
-				DPrintf("raft = %d, term = %d, state = %d, got enough vote   \t\t become(StateLeader)!", rf.me, rf.currentTerm, rf.currState)
+				DPrintf("raft = %d, term = %d, state = %d, got enough vote \t\t become(StateLeader)!", rf.me, rf.currentTerm, rf.currState)
 				rf.become(StateLeader)
 			}
 		} else {
-			DPrintf("raft = %d, term = %d, state = %d, got event = %d     \t\t do nothing!", rf.me, rf.currentTerm, rf.currState, event.event)
+			DPrintf("raft = %d, term = %d, state = %d, got event = %d \t\t do nothing!", rf.me, rf.currentTerm, rf.currState, event.event)
 			if event.term > rf.currentTerm {
 				/* become before step
 				rf.become(StateFollower)
@@ -627,7 +644,7 @@ func (rf *Raft) stepCandidate(event Event)  {
 		}
 
 	default:
-		DPrintf("raft = %d, term = %d, state = %d, got event = %d     \t\t Unexpected do nothing!", rf.me, rf.currentTerm, rf.currState, event.event)
+		DPrintf("raft = %d, term = %d, state = %d, got event = %d \t\t Unexpected do nothing!", rf.me, rf.currentTerm, rf.currState, event.event)
 	}
 }
 
@@ -654,10 +671,10 @@ func (rf *Raft) becomeLeader()  {
 func (rf *Raft) leaderStep(event Event)  {
 	switch event.event {
 	case EventLeaderHeartbeatTimeout:
-		DPrintf("raft = %d, term = %d, state = %d, got event = %d     \t\t resetTimer!", rf.me, rf.currentTerm, rf.currState, event.event)
+		DPrintf("raft = %d, term = %d, state = %d, got event = %d \t\t resetTimer!", rf.me, rf.currentTerm, rf.currState, event.event)
 		rf.resetTimer();
 	case EventAppendEntriesRes:
-		DPrintf("raft = %d, term = %d, state = %d, got event = %d     \t\t do something!", rf.me, rf.currentTerm, rf.currState, event.event)
+		DPrintf("raft = %d, term = %d, state = %d, got event = %d \t\t do something!", rf.me, rf.currentTerm, rf.currState, event.event)
 		if event.success {
 			// If successful: update nextIndex and matchIndex for follower
 			rf.matchIndex[event.peer] = rf.nextIndex[event.peer]
@@ -671,7 +688,7 @@ func (rf *Raft) leaderStep(event Event)  {
 			rf.sendAppendEntries2peer(event.peer)
 		}
 	default:
-		DPrintf("raft = %d, term = %d, state = %d, got event = %d     \t\t Unexpected do nothing!", rf.me, rf.currentTerm, rf.currState, event.event)
+		DPrintf("raft = %d, term = %d, state = %d, got event = %d \t\t Unexpected do nothing!", rf.me, rf.currentTerm, rf.currState, event.event)
 	}
 }
 
@@ -679,7 +696,7 @@ func (rf *Raft) leaderStep(event Event)  {
 // set currentTerm = T, convert to follower
 func (rf *Raft) termChallenge(remoteTerm int)  {
 	if remoteTerm > rf.currentTerm {
-		DPrintf("raft = %d, term = %d, state = %d, termChallengeFail \t\t become(StateFollower)!", rf.me, rf.currentTerm, rf.currState)
+		DPrintf("raft = %d, term = %d, state = %d, termChallengeFail \t become(StateFollower)!", rf.me, rf.currentTerm, rf.currState)
 		rf.currentTerm = remoteTerm
 		rf.become(StateFollower)
 	}
@@ -688,11 +705,21 @@ func (rf *Raft) termChallenge(remoteTerm int)  {
 func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply)  {
 
 	rf.assertLockHeld("need locked before call handleAppendEntries!")
+
+	// do step before return
+	defer rf.step(Event{event:EventAppendEntriesReq, term:args.Term})
+
+	// check term
 	rf.termChallenge(args.Term)
 
-	// init
+	// init defalt
 	reply.Success = true
 	reply.Term = rf.currentTerm
+
+	// leader do not handle this msg
+	if rf.currState == StateLeader {
+		return
+	}
 
 	//  Reply false if term < currentTerm
 	if args.Term < rf.currentTerm {
@@ -756,19 +783,27 @@ func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 	for ; rf.commitIndex > rf.lastApplied; rf.lastApplied++ {
 		// apply log[lastApplied] to state machine
 	}
-
-	if reply.Success {
-		rf.step(Event{event:EventAppendEntriesReq, term:args.Term})
-	}
 }
 
 func (rf *Raft) handleRequestVote(args *RequestVoteArgs, reply *RequestVoteReply)  {
 	rf.assertLockHeld("need locked before call handleRequestVote!")
+
+	// do step before return
+	defer rf.step(Event{event:EventRequestVoteReq, term:args.Term})
+
+	// check term
 	rf.termChallenge(args.Term)
 
-	// init
+	// init defalt
 	reply.VoteGranted = false
 	reply.Term = rf.currentTerm
+
+
+	// leader candidate just reject
+	if rf.currState == StateLeader || rf.currState == StateCandidate {
+		reply.VoteGranted = false
+		return
+	}
 
 	// Reply false if term < currentTerm
 	if args.Term < rf.currentTerm {
@@ -785,23 +820,16 @@ func (rf *Raft) handleRequestVote(args *RequestVoteArgs, reply *RequestVoteReply
 	// end with the same term, then whichever log is longer is
 	// more up-to-date.
 	if rf.votedFor < 0 || rf.votedFor == args.CandidateId {
-
 		lastEntrieIndex := len(rf.log)
 		entry := rf.log[lastEntrieIndex - 1]
 
 		if args.LastLogTerm > entry.Term {
 			reply.VoteGranted = true
-		}
-
-		if args.LastLogTerm == entry.Term {
+		}else if args.LastLogTerm == entry.Term {
 			if args.LastLogIndex >= entry.Index {
 				reply.VoteGranted = true
 			}
 		}
-	}
-
-	if reply.VoteGranted {
-		rf.step(Event{event:EventRequestVoteReq, term:args.Term})
 	}
 }
 
