@@ -246,15 +246,17 @@ func (rf *Raft) sendAppendEntries2peer(p int) {
 		prevLogTerm 	= rf.log[arrIndex].Term
 	}
 
-	/** copy from matchIndex to nextLogIndex
+	/** copy from matchIndex to min(nextLogIndex,end)
 	 *
 	 *	matchIndex	nextLogIndex	end
 	 * 	--- | --------- | ---------- |
 	 */
 	matchIndex := rf.matchIndex[p]
-	if matchIndex < nextLogIndex &&  nextLogIndex <= len(rf.log) {
-		entries = rf.log[matchIndex:nextLogIndex]
+	matchEndIndex := nextLogIndex
+	if len(rf.log) < matchEndIndex  {
+		matchEndIndex = len(rf.log)
 	}
+	entries = rf.log[matchIndex:matchEndIndex]
 
 	go func(peer int) {
 		args := AppendEntriesArgs{term, leaderId, prevLogIndex, prevLogTerm, entries, leaderCommit}
@@ -385,7 +387,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	isLeader = rf.currState == StateLeader
 	if isLeader {
-		DPrintf("[raft=%-2d state=%-1d term=%-2d] Leader recieve cmd \t before append log count = %d!", rf.me, rf.currState, rf.currentTerm, len(rf.log))
+		DPrintf("[raft=%-2d state=%-1d term=%-2d] Leader recieve cmd, before append log count = %d!", rf.me, rf.currState, rf.currentTerm, len(rf.log))
 
 		index = len(rf.log)
 		term = rf.currentTerm
@@ -397,10 +399,13 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.log = append(rf.log, entry)
 		rf.matchIndex[rf.me] = len(rf.log)
 
-		DPrintf("[raft=%-2d state=%-1d term=%-2d] Leader recieve cmd \t after append log count = %d!", rf.me, rf.currState, rf.currentTerm, len(rf.log))
+		DPrintf("[raft=%-2d state=%-1d term=%-2d] Leader recieve cmd, after append log count = %d!", rf.me, rf.currState, rf.currentTerm, len(rf.log))
 
-		// bcast
-		rf.bcastAppendEntries()
+		// check commit
+		rf.leaderMaybeCommit()
+
+		// todo too many rpcs need bcast?
+		// rf.bcastAppendEntries()
 	}
 
 	rf.doUnlock()
@@ -549,7 +554,7 @@ func (rf *Raft) background() {
 
 	// init state
 	rf.doLock()
-	DPrintf("[raft=%-2d state=%-1d term=%-2d] first init \t\t\t become(StateFollower)!", rf.me, rf.currState, rf.currentTerm)
+	DPrintf("[raft=%-2d state=%-1d term=%-2d] first init, become(StateFollower)!", rf.me, rf.currState, rf.currentTerm)
 	rf.become(StateFollower)
 	rf.doUnlock()
 
@@ -594,7 +599,8 @@ func (rf *Raft) become(state StateType)  {
 	rf.becomes[rf.currState]()
 }
 
-const ElectionTimeOut = 300
+const ElectionTimeOut 	= 150
+const LeaderTimeOut 	= 100
 func (rf *Raft) resetTimer()  {
 	switch rf.currState {
 	case StateFollower:
@@ -602,7 +608,7 @@ func (rf *Raft) resetTimer()  {
 	case StateCandidate:
 		rf.timers[StateCandidate].Reset(time.Duration(rand.Intn(ElectionTimeOut) +ElectionTimeOut) * time.Millisecond)
 	case StateLeader:
-		rf.timers[StateLeader].Reset(time.Duration(ElectionTimeOut) * time.Millisecond)
+		rf.timers[StateLeader].Reset(time.Duration(LeaderTimeOut) * time.Millisecond)
 	}
 }
 
@@ -615,16 +621,16 @@ func (rf *Raft) stepFollower(event Event)  {
 	// RPC from current leader or granting vote to candidate: convert to candidate
 	switch event.event {
 	case EventAppendEntriesReq:
-		DPrintf("[raft=%-2d state=%-1d term=%-2d] got event = %d \t\t resetTimer!", rf.me, rf.currState, rf.currentTerm, event.event)
+		DPrintf("[raft=%-2d state=%-1d term=%-2d] got event = %d, resetTimer!", rf.me, rf.currState, rf.currentTerm, event.event)
 		rf.resetTimer()
 	case EventRequestVoteReq:
-		DPrintf("[raft=%-2d state=%-1d term=%-2d] got event = %d \t\t resetTimer!", rf.me, rf.currState, rf.currentTerm, event.event)
+		DPrintf("[raft=%-2d state=%-1d term=%-2d] got event = %d, resetTimer!", rf.me, rf.currState, rf.currentTerm, event.event)
 		rf.resetTimer()
 	case EventFollowerElectionTimeout:
-		DPrintf("[raft=%-2d state=%-1d term=%-2d] got event = %d \t\t become(StateCandidate)!", rf.me, rf.currState, rf.currentTerm, event.event)
+		DPrintf("[raft=%-2d state=%-1d term=%-2d] got event = %d, become(StateCandidate)!", rf.me, rf.currState, rf.currentTerm, event.event)
 		rf.become(StateCandidate)
 	default:
-		DPrintf("[raft=%-2d state=%-1d term=%-2d] got event = %d \t\t Unexpected do nothing!", rf.me, rf.currState, rf.currentTerm, event.event)
+		DPrintf("[raft=%-2d state=%-1d term=%-2d] got event = %d, unexpected do nothing!", rf.me, rf.currState, rf.currentTerm, event.event)
 	}
 }
 
@@ -645,24 +651,24 @@ func (rf *Raft) becomeCandidate()  {
 func (rf *Raft) stepCandidate(event Event)  {
 	switch event.event {
 	case EventCandidateElectionTimeout:
-		DPrintf("[raft=%-2d state=%-1d term=%-2d] got event = %d \t\t become(StateCandidate)!", rf.me, rf.currState, rf.currentTerm, event.event)
+		DPrintf("[raft=%-2d state=%-1d term=%-2d] got event = %d, become(StateCandidate)!", rf.me, rf.currState, rf.currentTerm, event.event)
 		// If election timeout elapses: start new election
 		rf.become(StateCandidate)
 	case EventAppendEntriesReq:
-		DPrintf("[raft=%-2d state=%-1d term=%-2d] got event = %d \t\t become(StateFollower)!", rf.me, rf.currState, rf.currentTerm, event.event)
+		DPrintf("[raft=%-2d state=%-1d term=%-2d] got event = %d, become(StateFollower)!", rf.me, rf.currState, rf.currentTerm, event.event)
 		// If AppendEntries RPC received from new leader: convert to follower
 		rf.become(StateFollower)
 	case EventRequestVoteRes:
 		// If votes received from majority of servers: become leader
 		if event.success {
-			DPrintf("[raft=%-2d state=%-1d term=%-2d] got event = %d \t\t add vote!", rf.me, rf.currState, rf.currentTerm, event.event)
+			DPrintf("[raft=%-2d state=%-1d term=%-2d] got event = %d, add vote!", rf.me, rf.currState, rf.currentTerm, event.event)
 			rf.voteCount ++
 			if rf.voteCount >= rf.q() {
-				DPrintf("[raft=%-2d state=%-1d term=%-2d] got enough vote \t become(StateLeader)!", rf.me, rf.currState, rf.currentTerm)
+				DPrintf("[raft=%-2d state=%-1d term=%-2d] got enough vote, become(StateLeader)!", rf.me, rf.currState, rf.currentTerm)
 				rf.become(StateLeader)
 			}
 		} else {
-			DPrintf("[raft=%-2d state=%-1d term=%-2d] got event = %d \t\t do nothing!", rf.me, rf.currState, rf.currentTerm, event.event)
+			DPrintf("[raft=%-2d state=%-1d term=%-2d] got event = %d, do nothing!", rf.me, rf.currState, rf.currentTerm, event.event)
 			if event.term > rf.currentTerm {
 				/* become before step
 				rf.become(StateFollower)
@@ -671,7 +677,7 @@ func (rf *Raft) stepCandidate(event Event)  {
 		}
 
 	default:
-		DPrintf("[raft=%-2d state=%-1d term=%-2d] got event = %d \t\t Unexpected do nothing!", rf.me, rf.currState, rf.currentTerm, event.event)
+		DPrintf("[raft=%-2d state=%-1d term=%-2d] got event = %d, unexpected do nothing!", rf.me, rf.currState, rf.currentTerm, event.event)
 	}
 }
 
@@ -698,17 +704,21 @@ func (rf *Raft) becomeLeader()  {
 func (rf *Raft) leaderStep(event Event)  {
 	switch event.event {
 	case EventLeaderHeartbeatTimeout:
-		DPrintf("[raft=%-2d state=%-1d term=%-2d] got event = %d \t\t resetTimer!", rf.me, rf.currState, rf.currentTerm, event.event)
+		DPrintf("[raft=%-2d state=%-1d term=%-2d] got event = %d, resetTimer!", rf.me, rf.currState, rf.currentTerm, event.event)
 		rf.resetTimer();
+		rf.bcastAppendEntries()
 	case EventAppendEntriesRes:
-		DPrintf("[raft=%-2d state=%-1d term=%-2d] got event = %d \t\t do something!", rf.me, rf.currState, rf.currentTerm, event.event)
+		DPrintf("[raft=%-2d state=%-1d term=%-2d] got event = %d, do something!", rf.me, rf.currState, rf.currentTerm, event.event)
 		if event.success {
 			// If successful: update nextIndex and matchIndex for follower
 			if event.index > 0 {
 				// this is not a heart beat res
 				rf.matchIndex[event.peer] = event.index
 				rf.nextIndex[event.peer] = event.index + 1
-				rf.leaderMaybeCommit()
+				if rf.leaderMaybeCommit() {
+					// todo too many rpcs need bcast?
+					// rf.bcastAppendEntries()
+				}
 			}
 		} else {
 			// If AppendEntries fails because of log inconsistency:
@@ -719,7 +729,7 @@ func (rf *Raft) leaderStep(event Event)  {
 			}
 		}
 	default:
-		DPrintf("[raft=%-2d state=%-1d term=%-2d] got event = %d \t\t Unexpected do nothing!", rf.me, rf.currState, rf.currentTerm, event.event)
+		DPrintf("[raft=%-2d state=%-1d term=%-2d] got event = %d, unexpected do nothing!", rf.me, rf.currState, rf.currentTerm, event.event)
 	}
 }
 
@@ -727,7 +737,7 @@ func (rf *Raft) leaderStep(event Event)  {
 // set currentTerm = T, convert to follower
 func (rf *Raft) termChallenge(remoteTerm int)  {
 	if remoteTerm > rf.currentTerm {
-		DPrintf("[raft=%-2d state=%-1d term=%-2d] termChallengeFail \t become(StateFollower)!", rf.me, rf.currState, rf.currentTerm)
+		DPrintf("[raft=%-2d state=%-1d term=%-2d] termChallengeFail, become(StateFollower)!", rf.me, rf.currState, rf.currentTerm)
 		rf.currentTerm = remoteTerm
 		rf.become(StateFollower)
 	}
@@ -777,7 +787,7 @@ func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 	// this is not a heart beat
 	reply.Index = 0
 	if len(args.Entries) > 0 {
-		DPrintf("[raft=%-2d state=%-1d term=%-2d] recieve logcount = %d \t before merge cur log count = %d!", rf.me, rf.currState, rf.currentTerm, len(args.Entries), len(rf.log))
+		DPrintf("[raft=%-2d state=%-1d term=%-2d] log recieve count = %d, before merge cur log count = %d!", rf.me, rf.currState, rf.currentTerm, len(args.Entries), len(rf.log))
 
 		// If an existing entry conflicts with a new one (same index
 		// but different terms), delete the existing entry and all that
@@ -797,9 +807,10 @@ func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 			if len(rf.log) < index {
 				// append
 				rf.log = append(rf.log, entry)
-				// update last index of reply
-				reply.Index = entry.Index
 			}
+
+			// update last index of reply
+			reply.Index = entry.Index
 		}
 
 		// check local log index order
@@ -809,7 +820,7 @@ func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 			}
 		}
 
-		DPrintf("[raft=%-2d state=%-1d term=%-2d] recieve logcount = %d \t after merge cur log count = %d!", rf.me, rf.currState, rf.currentTerm, len(args.Entries), len(rf.log))
+		DPrintf("[raft=%-2d state=%-1d term=%-2d] log recieve count = %d, after merge cur log count = %d!", rf.me, rf.currState, rf.currentTerm, len(args.Entries), len(rf.log))
 	}
 
 	// If leaderCommit > commitIndex, set commitIndex =
@@ -823,7 +834,11 @@ func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 			commitTo = indexOfLastNewEntry
 		}
 
-		rf.commitTo(commitTo)
+		if commitTo > rf.commitIndex {
+			rf.commitTo(commitTo)
+		} else if commitTo < rf.commitIndex {
+			panic("commitTo less than rf.commitIndex !! ")
+		}
 	}
 }
 
@@ -876,6 +891,11 @@ func (rf *Raft) handleRequestVote(args *RequestVoteArgs, reply *RequestVoteReply
 			}
 		}
 	}
+
+	// update votedFor
+	if reply.VoteGranted == true {
+		rf.votedFor = args.CandidateId
+	}
 }
 
 func (rf *Raft) handleReply(event Event)  {
@@ -898,7 +918,7 @@ func (p intSlice) Swap(i, j int)      { p[i], p[j] = p[j], p[i] }
  * of matchIndex[i] ≥ N, and log[N].term == currentTerm:
  * set commitIndex = N
  */
-func (rf *Raft) leaderMaybeCommit() {
+func (rf *Raft) leaderMaybeCommit() bool {
 	mis := make(intSlice, 0, len(rf.peers))
 	for p := range rf.peers {
 		mis = append(mis, rf.matchIndex[p])
@@ -906,16 +926,19 @@ func (rf *Raft) leaderMaybeCommit() {
 	sort.Sort(sort.Reverse(mis))
 	mci := mis[rf.q()-1]
 
-	// commit and apply
-	rf.commitTo(mci)
+	// commit
+	if mci > rf.commitIndex {
+		rf.commitTo(mci)
+		return true
+	}
+
+	return false
 }
 
 func (rf *Raft) commitTo(to int) {
-	if rf.commitIndex < to {
-		DPrintf("[raft=%-2d state=%-1d term=%-2d] recieve log commit \t commmit index = %d!", rf.me, rf.currState, rf.currentTerm, to)
-		rf.commitIndex = to
-		rf.applyToCommmit()
-	}
+	DPrintf("[raft=%-2d state=%-1d term=%-2d] log commit, commmit index = %d!", rf.me, rf.currState, rf.currentTerm, to)
+	rf.commitIndex = to
+	rf.applyToCommmit()
 }
 
 /**
@@ -923,20 +946,21 @@ func (rf *Raft) commitTo(to int) {
  *	log[lastApplied] to state machine
  */
 func (rf *Raft) applyToCommmit() {
-	for {
-		rf.lastApplied++
-		if rf.lastApplied > rf.commitIndex {
-			panic("lastApplied > commitIndex")
-		}
 
-		DPrintf("[raft=%-2d state=%-1d term=%-2d] recieve log apply \t apply index = %d!", rf.me, rf.currState, rf.currentTerm, rf.lastApplied)
+	// check
+	if rf.lastApplied > rf.commitIndex {
+		panic("lastApplied > commitIndex")
+	}
 
+	for tmp := rf.lastApplied + 1; tmp <= rf.commitIndex; tmp ++ {
+		// do apply
+		rf.lastApplied = tmp
+
+		// apply msg to client
 		arrIndex := rf.lastApplied - 1
 		applyMsg := ApplyMsg{true, rf.log[arrIndex].Command, rf.log[arrIndex].Index}
-		rf.applyCh <- applyMsg
+		DPrintf("[raft=%-2d state=%-1d term=%-2d] log apply, apply index = %d, applyMsg = %v!", rf.me, rf.currState, rf.currentTerm, rf.lastApplied, applyMsg)
 
-		if rf.lastApplied == rf.commitIndex {
-			break
-		}
+		rf.applyCh <- applyMsg
 	}
 }
