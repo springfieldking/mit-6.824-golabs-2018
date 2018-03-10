@@ -387,7 +387,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	isLeader = rf.currState == StateLeader
 	if isLeader {
-		DPrintf("[raft=%-2d state=%-1d term=%-2d] Leader recieve cmd, before append log count = %d!", rf.me, rf.currState, rf.currentTerm, len(rf.log))
+		beforeLogCount := len(rf.log)
 
 		index = len(rf.log)
 		term = rf.currentTerm
@@ -399,11 +399,13 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.log = append(rf.log, entry)
 		rf.matchIndex[rf.me] = len(rf.log)
 
-		DPrintf("[raft=%-2d state=%-1d term=%-2d] Leader recieve cmd, after append log count = %d!", rf.me, rf.currState, rf.currentTerm, len(rf.log))
+		// persist
+		rf.persist()
 
 		// check commit
 		rf.leaderMaybeCommit()
 
+		DPrintf("[raft=%-2d state=%-1d term=%-2d] Leader recieve cmd = %v, before logcount = %d, after log count = %d!", rf.me, rf.currState, rf.currentTerm, command, beforeLogCount, len(rf.log))
 		// todo too many rpcs need bcast?
 		// rf.bcastAppendEntries()
 	}
@@ -597,6 +599,9 @@ func (rf *Raft) become(state StateType)  {
 	rf.currState = state
 	rf.reset()
 	rf.becomes[rf.currState]()
+
+	// persist
+	rf.persist()
 }
 
 const ElectionTimeOut 	= 150
@@ -787,7 +792,7 @@ func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 	// this is not a heart beat
 	reply.Index = 0
 	if len(args.Entries) > 0 {
-		DPrintf("[raft=%-2d state=%-1d term=%-2d] log recieve count = %d, before merge cur log count = %d!", rf.me, rf.currState, rf.currentTerm, len(args.Entries), len(rf.log))
+		beforeLogCount := len(rf.log)
 
 		// If an existing entry conflicts with a new one (same index
 		// but different terms), delete the existing entry and all that
@@ -820,7 +825,10 @@ func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 			}
 		}
 
-		DPrintf("[raft=%-2d state=%-1d term=%-2d] log recieve count = %d, after merge cur log count = %d!", rf.me, rf.currState, rf.currentTerm, len(args.Entries), len(rf.log))
+		// persist
+		rf.persist()
+
+		DPrintf("[raft=%-2d state=%-1d term=%-2d] log recieve count = %d, before log count = %d, after log count = %d, new logs = %v", rf.me, rf.currState, rf.currentTerm, len(args.Entries), beforeLogCount, len(rf.log), args.Entries)
 	}
 
 	// If leaderCommit > commitIndex, set commitIndex =
@@ -885,7 +893,7 @@ func (rf *Raft) handleRequestVote(args *RequestVoteArgs, reply *RequestVoteReply
 
 		if args.LastLogTerm > lastEntryTerm {
 			reply.VoteGranted = true
-		}else if args.LastLogTerm == lastEntryTerm {
+		} else if args.LastLogTerm == lastEntryTerm {
 			if args.LastLogIndex >= lastEntryIndex {
 				reply.VoteGranted = true
 			}
@@ -895,6 +903,8 @@ func (rf *Raft) handleRequestVote(args *RequestVoteArgs, reply *RequestVoteReply
 	// update votedFor
 	if reply.VoteGranted == true {
 		rf.votedFor = args.CandidateId
+		// persist
+		rf.persist()
 	}
 }
 
