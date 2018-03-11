@@ -197,7 +197,6 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply  struct {
 	Term			int 		// currentTerm, for leader to update itself
 	Success			bool		// true if follower contained entry matching prevLogIndex and prevLogTerm
-	Index			int 		// for update nextIndex
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -212,7 +211,8 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	if ok {
 		// recieve AppendEntries res
 		rf.doLock()
-		rf.handleReply(Event{event:EventAppendEntriesRes, success:reply.Success, term:reply.Term, peer:server, index:reply.Index})
+		targetIndex := args.PrevLogIndex + len(args.Entries)
+		rf.handleReply(Event{event:EventAppendEntriesRes, success:reply.Success, term:reply.Term, peer:server, index:targetIndex})
 		rf.doUnlock()
 	}
 	return ok
@@ -716,8 +716,7 @@ func (rf *Raft) leaderStep(event Event)  {
 		DPrintf("[raft=%-2d state=%-1d term=%-2d] got event = %d, do something!", rf.me, rf.currState, rf.currentTerm, event.event)
 		if event.success {
 			// If successful: update nextIndex and matchIndex for follower
-			if event.index > 0 {
-				// this is not a heart beat res
+			if event.index != rf.matchIndex[event.peer] {
 				rf.matchIndex[event.peer] = event.index
 				rf.nextIndex[event.peer] = event.index + 1
 				if rf.leaderMaybeCommit() {
@@ -740,6 +739,8 @@ func (rf *Raft) leaderStep(event Event)  {
 
 // If RPC request or response contains term T > currentTerm:
 // set currentTerm = T, convert to follower
+// Ensure that you follow the second rule in “Rules for Servers”
+// before handling an incoming RPC. The second rule states:
 func (rf *Raft) termChallenge(remoteTerm int)  {
 	if remoteTerm > rf.currentTerm {
 		DPrintf("[raft=%-2d state=%-1d term=%-2d] termChallengeFail, become(StateFollower)!", rf.me, rf.currState, rf.currentTerm)
@@ -756,12 +757,12 @@ func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 	rf.termChallenge(args.Term)
 
 	// init defalt
-	reply.Success = true
+	reply.Success = false
 	reply.Term = rf.currentTerm
-	reply.Index = len(rf.log)
 
 	// leader do not handle this msg
 	if rf.currState == StateLeader {
+		reply.Success = false
 		return
 	}
 
@@ -770,9 +771,6 @@ func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 		reply.Success = false
 		return
 	}
-
-	// do step before return
-	defer rf.step(Event{event:EventAppendEntriesReq, term:args.Term})
 
 	// Reply false if log doesn’t contain an entry at prevLogIndex
 	// whose term matches prevLogTerm
@@ -789,47 +787,42 @@ func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 		}
 	}
 
-	// this is not a heart beat
-	reply.Index = 0
-	if len(args.Entries) > 0 {
-		beforeLogCount := len(rf.log)
-
-		// If an existing entry conflicts with a new one (same index
-		// but different terms), delete the existing entry and all that
-		// follow it
-		// Append any new entries not already in the log
-		for _, entry := range args.Entries {
-			index := entry.Index
-			if len(rf.log) >= index {
-				if rf.log[index - 1].Term == entry.Term {
-					// do nothing
-				} else {
-					// delete the existing entry and all that follow it
-					rf.log = rf.log[:index - 1]
-				}
-			}
-
-			if len(rf.log) < index {
-				// append
-				rf.log = append(rf.log, entry)
-			}
-
-			// update last index of reply
-			reply.Index = entry.Index
-		}
-
-		// check local log index order
-		for i := 0; i < len(rf.log); i ++ {
-			if rf.log[i].Index != i + 1 {
-				panic("log index order error")
+	beforeLogCount := len(rf.log)
+	// If an existing entry conflicts with a new one (same index
+	// but different terms), delete the existing entry and all that
+	// follow it
+	// Append any new entries not already in the log
+	reply.Success = true
+	for _, entry := range args.Entries {
+		index := entry.Index
+		if len(rf.log) >= index {
+			if rf.log[index - 1].Term == entry.Term {
+				// do nothing
+			} else {
+				// delete the existing entry and all that follow it
+				rf.log = rf.log[:index - 1]
 			}
 		}
 
-		// persist
-		rf.persist()
-
-		DPrintf("[raft=%-2d state=%-1d term=%-2d] log recieve count = %d, before log count = %d, after log count = %d, new logs = %v", rf.me, rf.currState, rf.currentTerm, len(args.Entries), beforeLogCount, len(rf.log), args.Entries)
+		if len(rf.log) < index {
+			// append
+			rf.log = append(rf.log, entry)
+		}
 	}
+
+	// check local log index order
+	for arrIndex, entry := range rf.log {
+		if entry.Index != arrIndex + 1 {
+			panic("log index order error")
+		}
+	}
+
+	// persist
+	if len(args.Entries) > 0 {
+		rf.persist()
+	}
+
+	DPrintf("[raft=%-2d state=%-1d term=%-2d] log recieve count = %d, before log count = %d, after log count = %d, new logs = %v", rf.me, rf.currState, rf.currentTerm, len(args.Entries), beforeLogCount, len(rf.log), args.Entries)
 
 	// If leaderCommit > commitIndex, set commitIndex =
 	// min(leaderCommit, index of last new entry)
@@ -848,13 +841,13 @@ func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 			panic("commitTo less than rf.commitIndex !! ")
 		}
 	}
+
+	// do step before return
+	rf.step(Event{event:EventAppendEntriesReq, term:args.Term})
 }
 
 func (rf *Raft) handleRequestVote(args *RequestVoteArgs, reply *RequestVoteReply)  {
 	rf.assertLockHeld("need locked before call handleRequestVote!")
-
-	// do step before return
-	defer rf.step(Event{event:EventRequestVoteReq, term:args.Term})
 
 	// check term
 	rf.termChallenge(args.Term)
@@ -903,18 +896,19 @@ func (rf *Raft) handleRequestVote(args *RequestVoteArgs, reply *RequestVoteReply
 	// update votedFor
 	if reply.VoteGranted == true {
 		rf.votedFor = args.CandidateId
+		// do step
+		// you should only restart your election timer
+		// if you grant a vote to another peer.
+		rf.step(Event{event:EventRequestVoteReq, term:args.Term})
 		// persist
 		rf.persist()
 	}
 }
 
 func (rf *Raft) handleReply(event Event)  {
-
 	rf.assertLockHeld("need locked before call handleReply!")
-	defer func() {
-		rf.termChallenge(event.term)
-		rf.step(event)
-	}()
+	rf.termChallenge(event.term)
+	rf.step(event)
 }
 
 
