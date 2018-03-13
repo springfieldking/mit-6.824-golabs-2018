@@ -197,6 +197,7 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply  struct {
 	Term			int 		// currentTerm, for leader to update itself
 	Success			bool		// true if follower contained entry matching prevLogIndex and prevLogTerm
+	Index 			int 		// next index
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -211,7 +212,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	if ok {
 		// recieve AppendEntries res
 		rf.doLock()
-		targetIndex := args.PrevLogIndex + len(args.Entries)
+		targetIndex := reply.Index
 		rf.handleReply(Event{event:EventAppendEntriesRes, success:reply.Success, term:reply.Term, peer:server, index:targetIndex})
 		rf.doUnlock()
 	}
@@ -237,26 +238,19 @@ func (rf *Raft) sendAppendEntries2peer(p int) {
 	leaderId		:= rf.me
 	leaderCommit	:= rf.commitIndex
 	nextLogIndex 	:= rf.nextIndex[p]
-	prevLogIndex 	:= rf.matchIndex[p]
-	prevLogTerm 	:= 0
+	prevLogIndex 	:= nextLogIndex -1
+	prevLogTerm 	:= rf.term(prevLogIndex)
 	entries			:= []LogEntry{}
 
-	if prevLogIndex > 0 {
-		arrIndex := prevLogIndex - 1
-		prevLogTerm 	= rf.log[arrIndex].Term
-	}
-
-	/** copy from matchIndex to min(nextLogIndex,end)
+	/** copy from nextLogIndex to lastLogIndex
 	 *
-	 *	matchIndex	nextLogIndex	end
+	 *	matchIndex  nextLogIndex  lastLogIndex
 	 * 	--- | --------- | ---------- |
 	 */
-	matchIndex := rf.matchIndex[p]
-	matchEndIndex := nextLogIndex
-	if len(rf.log) < matchEndIndex  {
-		matchEndIndex = len(rf.log)
+	lastLogIndex := len(rf.log)
+	if nextLogIndex <= lastLogIndex {
+		entries = rf.log[nextLogIndex - 1:lastLogIndex]
 	}
-	entries = rf.log[matchIndex:matchEndIndex]
 
 	go func(peer int) {
 		args := AppendEntriesArgs{term, leaderId, prevLogIndex, prevLogTerm, entries, leaderCommit}
@@ -387,8 +381,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	isLeader = rf.currState == StateLeader
 	if isLeader {
-		beforeLogCount := len(rf.log)
-
 		index = len(rf.log)
 		term = rf.currentTerm
 
@@ -405,7 +397,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		// check commit
 		rf.leaderMaybeCommit()
 
-		DPrintf("[raft=%-2d state=%-1d term=%-2d] Leader recieve cmd = %v, before logcount = %d, after log count = %d!", rf.me, rf.currState, rf.currentTerm, command, beforeLogCount, len(rf.log))
+		DPrintf("[raft=%-2d state=%-1d term=%-2d] log recieve, entry = %v!", rf.me, rf.currState, rf.currentTerm, entry)
+
 		// todo too many rpcs need bcast?
 		// rf.bcastAppendEntries()
 	}
@@ -548,7 +541,7 @@ func (rf *Raft) background() {
 	}()
 
 	// init state handler
-	rf.steps = []StateStep{rf.stepFollower, rf.stepCandidate, rf.leaderStep}
+	rf.steps = []StateStep{rf.stepFollower, rf.stepCandidate, rf.stepLeader}
 	rf.becomes = []StateChange{rf.becomeFollower, rf.becomeCandidate, rf.becomeLeader}
 
 	// init log
@@ -706,30 +699,31 @@ func (rf *Raft) becomeLeader()  {
 	rf.bcastAppendEntries()
 }
 
-func (rf *Raft) leaderStep(event Event)  {
+func (rf *Raft) stepLeader(event Event)  {
 	switch event.event {
 	case EventLeaderHeartbeatTimeout:
 		DPrintf("[raft=%-2d state=%-1d term=%-2d] got event = %d, resetTimer!", rf.me, rf.currState, rf.currentTerm, event.event)
 		rf.resetTimer();
 		rf.bcastAppendEntries()
 	case EventAppendEntriesRes:
-		DPrintf("[raft=%-2d state=%-1d term=%-2d] got event = %d, do something!", rf.me, rf.currState, rf.currentTerm, event.event)
+		DPrintf("[raft=%-2d state=%-1d term=%-2d] got event = %d, event = %v!", rf.me, rf.currState, rf.currentTerm, event.event, event)
 		if event.success {
 			// If successful: update nextIndex and matchIndex for follower
-			if event.index != rf.matchIndex[event.peer] {
-				rf.matchIndex[event.peer] = event.index
-				rf.nextIndex[event.peer] = event.index + 1
-				if rf.leaderMaybeCommit() {
-					// todo too many rpcs need bcast?
-					// rf.bcastAppendEntries()
-				}
+			rf.matchIndex[event.peer] = event.index
+			rf.nextIndex[event.peer] = event.index + 1
+
+			if rf.leaderMaybeCommit() {
+				// too many rpcs need this?
+				// rf.bcastAppendEntries()
 			}
 		} else {
 			// If AppendEntries fails because of log inconsistency:
 			// decrement nextIndex and retry
-			if rf.nextIndex[event.peer] > 0 {
-				rf.nextIndex[event.peer] --
-				rf.sendAppendEntries2peer(event.peer)
+			nextIndex := event.index + 1
+			if rf.nextIndex[event.peer] != nextIndex {
+				rf.nextIndex[event.peer] = nextIndex
+				// too many rpcs need this?
+				// rf.sendAppendEntries2peer(event.peer)
 			}
 		}
 	default:
@@ -749,9 +743,20 @@ func (rf *Raft) termChallenge(remoteTerm int)  {
 	}
 }
 
+func (rf *Raft) matchTerm(index, term int) bool { return rf.term(index) == term }
+
+func (rf *Raft) term(index int) int {
+	if index < 1 || index > len(rf.log) {
+		return 0
+	}
+
+	return rf.log[index - 1].Term
+}
+
 func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply)  {
 
 	rf.assertLockHeld("need locked before call handleAppendEntries!")
+	DPrintf("[raft=%-2d state=%-1d term=%-2d] handleAppendEntries rf.log = %v, args = %v", rf.me, rf.currState, rf.currentTerm, rf.log, args)
 
 	// check term
 	rf.termChallenge(args.Term)
@@ -759,40 +764,45 @@ func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 	// init defalt
 	reply.Success = false
 	reply.Term = rf.currentTerm
+	reply.Index = len(rf.log)
 
 	// leader do not handle this msg
 	if rf.currState == StateLeader {
-		reply.Success = false
+		DPrintf("[raft=%-2d state=%-1d term=%-2d] handleAppendEntries error not StateLeader, replyIndex = %d", rf.me, rf.currState, rf.currentTerm, reply.Index)
 		return
 	}
 
 	//  Reply false if term < currentTerm
 	if args.Term < rf.currentTerm {
-		reply.Success = false
+		DPrintf("[raft=%-2d state=%-1d term=%-2d] handleAppendEntries error args term out date, replyIndex = %d", rf.me, rf.currState, rf.currentTerm, rf.currentTerm, reply.Index)
 		return
 	}
 
 	// Reply false if log doesn’t contain an entry at prevLogIndex
 	// whose term matches prevLogTerm
-	if len(rf.log) < args.PrevLogIndex {
-		reply.Success = false
-		return
-	} else {
-		if args.PrevLogIndex > 0 {
-			arrIndex := args.PrevLogIndex - 1
-			if rf.log[arrIndex].Term != args.PrevLogTerm {
-				reply.Success = false
-				return
+	if !rf.matchTerm(args.PrevLogIndex, args.PrevLogTerm) {
+		conflictIndex:= rf.term(args.PrevLogIndex)
+		var index = 0
+		for index = args.PrevLogIndex -1; index >= rf.commitIndex; index -- {
+			if !rf.matchTerm(index, conflictIndex) {
+				break
 			}
 		}
+
+		if index < 0 {
+			index = 0
+		}
+
+		reply.Index = index
+
+		DPrintf("[raft=%-2d state=%-1d term=%-2d] handleAppendEntries error matchTerm failed, replyIndex = %d ", rf.me, rf.currState, rf.currentTerm, reply.Index)
+		return
 	}
 
-	beforeLogCount := len(rf.log)
 	// If an existing entry conflicts with a new one (same index
 	// but different terms), delete the existing entry and all that
 	// follow it
 	// Append any new entries not already in the log
-	reply.Success = true
 	for _, entry := range args.Entries {
 		index := entry.Index
 		if len(rf.log) >= index {
@@ -807,6 +817,7 @@ func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 		if len(rf.log) < index {
 			// append
 			rf.log = append(rf.log, entry)
+			DPrintf("[raft=%-2d state=%-1d term=%-2d] log recieve, entry = %v!", rf.me, rf.currState, rf.currentTerm, entry)
 		}
 	}
 
@@ -817,12 +828,14 @@ func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 		}
 	}
 
+	// update reply
+	reply.Success = true
+	reply.Index = len(rf.log)
+
 	// persist
 	if len(args.Entries) > 0 {
 		rf.persist()
 	}
-
-	DPrintf("[raft=%-2d state=%-1d term=%-2d] log recieve count = %d, before log count = %d, after log count = %d, new logs = %v", rf.me, rf.currState, rf.currentTerm, len(args.Entries), beforeLogCount, len(rf.log), args.Entries)
 
 	// If leaderCommit > commitIndex, set commitIndex =
 	// min(leaderCommit, index of last new entry)
@@ -841,6 +854,8 @@ func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 			panic("commitTo less than rf.commitIndex !! ")
 		}
 	}
+
+	DPrintf("[raft=%-2d state=%-1d term=%-2d] handleAppendEntries end, after log count = %d, commitIndex = %d, replyIndex = %d,  rf.log = %v", rf.me, rf.currState, rf.currentTerm, len(rf.log), rf.commitIndex, reply.Index, rf.log)
 
 	// do step before return
 	rf.step(Event{event:EventAppendEntriesReq, term:args.Term})
@@ -963,7 +978,7 @@ func (rf *Raft) applyToCommmit() {
 		// apply msg to client
 		arrIndex := rf.lastApplied - 1
 		applyMsg := ApplyMsg{true, rf.log[arrIndex].Command, rf.log[arrIndex].Index}
-		DPrintf("[raft=%-2d state=%-1d term=%-2d] log apply, apply index = %d, applyMsg = %v!", rf.me, rf.currState, rf.currentTerm, rf.lastApplied, applyMsg)
+		DPrintf("[raft=%-2d state=%-1d term=%-2d] log apply, entry = %v!", rf.me, rf.currState, rf.currentTerm, rf.log[arrIndex])
 
 		rf.applyCh <- applyMsg
 	}
