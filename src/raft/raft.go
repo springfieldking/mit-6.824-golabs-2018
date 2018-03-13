@@ -101,7 +101,7 @@ type Raft struct {
 	timers 				[]*time.Timer
 	// state func
 	steps   			[]StateStep
-	becomes 			[]StateChange
+	becomes 			[]StateBecome
 	// rand
 	rand                *rand.Rand
 	// lockSate
@@ -208,24 +208,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-
-	currentTermHasLog := rf.currentTerm == rf.term(len(rf.log))
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
-	if ok {
-		// recieve AppendEntries res
-		rf.doLock()
-		if rf.currentTerm == args.Term {
-			rf.handleReply(
-				Event{
-				event:EventAppendEntriesRes,
-				success:reply.Success,
-				term:reply.Term,
-				peer:server,
-				index:reply.Index,
-				currentTermHasLog:currentTermHasLog})
-		}
-		rf.doUnlock()
-	}
 	return ok
 }
 
@@ -238,7 +221,6 @@ func (rf *Raft) bcastAppendEntries() {
 		if p == rf.me {
 			continue
 		}
-
 		rf.sendAppendEntries2peer(p)
 	}
 }
@@ -262,10 +244,44 @@ func (rf *Raft) sendAppendEntries2peer(p int) {
 		entries = rf.log[nextLogIndex - 1:lastLogIndex]
 	}
 
+	// has curr term log
+	currentTermHasLog := rf.currentTerm == rf.term(len(rf.log))
+
 	go func(peer int) {
 		args := AppendEntriesArgs{term, leaderId, prevLogIndex, prevLogTerm, entries, leaderCommit}
 		reply := AppendEntriesReply{}
-		rf.sendAppendEntries(peer, &args, &reply)
+		if rf.sendAppendEntries(peer, &args, &reply) {
+			// handleAppendEntriesRes
+			rf.doLock()
+			{
+				// only Leader handler this rely
+				// is currentTerm request
+				// and then check term
+				DPrintf("[raft=%-2d state=%-1d term=%-2d] handleAppendEntriesRes reply = %v", rf.me, rf.currState, rf.currentTerm, reply)
+				if rf.currState == StateLeader && rf.currentTerm == args.Term && rf.termChallenge(reply.Term) {
+					if reply.Success {
+						// If successful: update nextIndex and matchIndex for follower
+						rf.matchIndex[peer] = reply.Index
+						rf.nextIndex[peer] = reply.Index + 1
+
+						if rf.leaderMaybeCommit(currentTermHasLog) {
+							// too many rpcs need this?
+							// rf.bcastAppendEntries()
+						}
+					} else {
+						// If AppendEntries fails because of log inconsistency:
+						// decrement nextIndex and retry
+						nextIndex := reply.Index + 1
+						if rf.nextIndex[peer] != nextIndex {
+							rf.nextIndex[peer] = nextIndex
+							// too many rpcs need this?
+							// rf.sendAppendEntries2peer(event.peer)
+						}
+					}
+				}
+			}
+			rf.doUnlock()
+		}
 	}(p)
 }
 
@@ -333,14 +349,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	if ok {
-		// recieve AppendEntries res
-		rf.doLock()
-		if rf.currentTerm == args.Term {
-			rf.handleReply(Event{event:EventRequestVoteRes, success:reply.VoteGranted, term:reply.Term, peer:server})
-		}
-		rf.doUnlock()
-	}
 	return ok
 }
 
@@ -364,7 +372,34 @@ func (rf *Raft) bcastRequestVote() {
 			go func(peer int) {
 				args := RequestVoteArgs{term, candidateId, lastLogIndex, lastLogTerm}
 				reply := RequestVoteReply{}
-				rf.sendRequestVote(peer, &args, &reply)
+				if rf.sendRequestVote(peer, &args, &reply) {
+					// handleRequestVoteRes
+					rf.doLock()
+					{
+						// only Candidate handler this rely
+						// is currentTerm request
+						// and then check term
+						DPrintf("[raft=%-2d state=%-1d term=%-2d] handleRequestVoteRes reply = %v", rf.me, rf.currState, rf.currentTerm, reply)
+						if rf.currState == StateCandidate && rf.currentTerm == args.Term && rf.termChallenge(reply.Term) {
+							if reply.VoteGranted {
+								DPrintf("[raft=%-2d state=%-1d term=%-2d] handleRequestVoteRes, add vote!", rf.me, rf.currState, rf.currentTerm)
+								rf.voteCount ++
+								if rf.voteCount == rf.q() {
+									DPrintf("[raft=%-2d state=%-1d term=%-2d] handleRequestVoteRes got enough vote, become(StateLeader)!", rf.me, rf.currState, rf.currentTerm)
+									rf.become(StateLeader)
+								}
+							} else {
+								DPrintf("[raft=%-2d state=%-1d term=%-2d] handleRequestVoteRes, do nothing!", rf.me, rf.currState, rf.currentTerm)
+								if reply.Term > rf.currentTerm {
+									/* become before step
+									rf.become(StateFollower)
+									*/
+								}
+							}
+						}
+					}
+					rf.doUnlock()
+				}
 			}(p)
 		}
 	}()
@@ -386,7 +421,7 @@ func (rf *Raft) bcastRequestVote() {
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
-	isLeader := true
+	isLeader := false
 
 	// Your code here (2B).
 	rf.doLock()
@@ -495,10 +530,6 @@ const (
 	EventFollowerElectionTimeout EventType = iota
 	EventCandidateElectionTimeout
 	EventLeaderHeartbeatTimeout
-	EventAppendEntriesReq
-	EventAppendEntriesRes
-	EventRequestVoteReq
-	EventRequestVoteRes
 	EventShutDown
 )
 
@@ -508,17 +539,10 @@ type Event struct {
 	// for req & reply
 	term	int
 	success bool
-
-	// for reply
-	peer 	int
-
-	// for app reply
-	index 	int
-	currentTermHasLog 	bool
 }
 
 type StateStep 			func (Event)
-type StateChange 		func ()
+type StateBecome 		func ()
 
 //
 // create a background, a state mashine loop
@@ -555,7 +579,7 @@ func (rf *Raft) background() {
 
 	// init state handler
 	rf.steps = []StateStep{rf.stepFollower, rf.stepCandidate, rf.stepLeader}
-	rf.becomes = []StateChange{rf.becomeFollower, rf.becomeCandidate, rf.becomeLeader}
+	rf.becomes = []StateBecome{rf.becomeFollower, rf.becomeCandidate, rf.becomeLeader}
 
 	// init log
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
@@ -611,7 +635,7 @@ func (rf *Raft) become(state StateType)  {
 }
 
 const ElectionTimeOut 	= 150
-const LeaderTimeOut 	= 100
+const LeaderTimeOut 	= 50
 func (rf *Raft) resetTimer()  {
 	switch rf.currState {
 	case StateFollower:
@@ -631,12 +655,6 @@ func (rf *Raft) stepFollower(event Event)  {
 	// If election timeout elapses without receiving AppendEntries
 	// RPC from current leader or granting vote to candidate: convert to candidate
 	switch event.event {
-	case EventAppendEntriesReq:
-		DPrintf("[raft=%-2d state=%-1d term=%-2d] got event = %d, resetTimer!", rf.me, rf.currState, rf.currentTerm, event.event)
-		rf.resetTimer()
-	case EventRequestVoteReq:
-		DPrintf("[raft=%-2d state=%-1d term=%-2d] got event = %d, resetTimer!", rf.me, rf.currState, rf.currentTerm, event.event)
-		rf.resetTimer()
 	case EventFollowerElectionTimeout:
 		DPrintf("[raft=%-2d state=%-1d term=%-2d] got event = %d, become(StateCandidate)!", rf.me, rf.currState, rf.currentTerm, event.event)
 		rf.become(StateCandidate)
@@ -665,28 +683,6 @@ func (rf *Raft) stepCandidate(event Event)  {
 		DPrintf("[raft=%-2d state=%-1d term=%-2d] got event = %d, become(StateCandidate)!", rf.me, rf.currState, rf.currentTerm, event.event)
 		// If election timeout elapses: start new election
 		rf.become(StateCandidate)
-	case EventAppendEntriesReq:
-		DPrintf("[raft=%-2d state=%-1d term=%-2d] got event = %d, become(StateFollower)!", rf.me, rf.currState, rf.currentTerm, event.event)
-		// If AppendEntries RPC received from new leader: convert to follower
-		rf.become(StateFollower)
-	case EventRequestVoteRes:
-		// If votes received from majority of servers: become leader
-		if event.success {
-			DPrintf("[raft=%-2d state=%-1d term=%-2d] got event = %d, add vote!", rf.me, rf.currState, rf.currentTerm, event.event)
-			rf.voteCount ++
-			if rf.voteCount >= rf.q() {
-				DPrintf("[raft=%-2d state=%-1d term=%-2d] got enough vote, become(StateLeader)!", rf.me, rf.currState, rf.currentTerm)
-				rf.become(StateLeader)
-			}
-		} else {
-			DPrintf("[raft=%-2d state=%-1d term=%-2d] got event = %d, do nothing!", rf.me, rf.currState, rf.currentTerm, event.event)
-			if event.term > rf.currentTerm {
-				/* become before step
-				rf.become(StateFollower)
-				*/
-			}
-		}
-
 	default:
 		DPrintf("[raft=%-2d state=%-1d term=%-2d] got event = %d, unexpected do nothing!", rf.me, rf.currState, rf.currentTerm, event.event)
 	}
@@ -718,27 +714,6 @@ func (rf *Raft) stepLeader(event Event)  {
 		DPrintf("[raft=%-2d state=%-1d term=%-2d] got event = %d, resetTimer!", rf.me, rf.currState, rf.currentTerm, event.event)
 		rf.resetTimer();
 		rf.bcastAppendEntries()
-	case EventAppendEntriesRes:
-		DPrintf("[raft=%-2d state=%-1d term=%-2d] got event = %d, event = %v!", rf.me, rf.currState, rf.currentTerm, event.event, event)
-		if event.success {
-			// If successful: update nextIndex and matchIndex for follower
-			rf.matchIndex[event.peer] = event.index
-			rf.nextIndex[event.peer] = event.index + 1
-
-			if rf.leaderMaybeCommit(event.currentTermHasLog) {
-				// too many rpcs need this?
-				// rf.bcastAppendEntries()
-			}
-		} else {
-			// If AppendEntries fails because of log inconsistency:
-			// decrement nextIndex and retry
-			nextIndex := event.index + 1
-			if rf.nextIndex[event.peer] != nextIndex {
-				rf.nextIndex[event.peer] = nextIndex
-				// too many rpcs need this?
-				rf.sendAppendEntries2peer(event.peer)
-			}
-		}
 	default:
 		DPrintf("[raft=%-2d state=%-1d term=%-2d] got event = %d, unexpected do nothing!", rf.me, rf.currState, rf.currentTerm, event.event)
 	}
@@ -748,12 +723,21 @@ func (rf *Raft) stepLeader(event Event)  {
 // set currentTerm = T, convert to follower
 // Ensure that you follow the second rule in “Rules for Servers”
 // before handling an incoming RPC. The second rule states:
-func (rf *Raft) termChallenge(remoteTerm int)  {
-	if remoteTerm > rf.currentTerm {
+func (rf *Raft) termChallenge(remoteTerm int) bool {
+	if rf.currentTerm < remoteTerm {
 		DPrintf("[raft=%-2d state=%-1d term=%-2d] termChallengeFail, become(StateFollower)!", rf.me, rf.currState, rf.currentTerm)
 		rf.currentTerm = remoteTerm
 		rf.become(StateFollower)
+		return false
 	}
+	return true
+}
+
+func (rf *Raft) lastLogIndexAndTerm() (int, int) {
+	lastLogIndex := len(rf.log)
+	lastLogTerm := rf.term(lastLogIndex)
+
+	return lastLogIndex, lastLogTerm
 }
 
 func (rf *Raft) matchTerm(index, term int) bool { return rf.term(index) == term }
@@ -769,27 +753,37 @@ func (rf *Raft) term(index int) int {
 func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply)  {
 
 	rf.assertLockHeld("need locked before call handleAppendEntries!")
-	DPrintf("[raft=%-2d state=%-1d term=%-2d] handleAppendEntries rf.log = %v, args = %v", rf.me, rf.currState, rf.currentTerm, rf.log, args)
-
-	// check term
-	rf.termChallenge(args.Term)
+	DPrintf("[raft=%-2d state=%-1d term=%-2d] handleAppendEntries begin rf.log = %v, args = %v", rf.me, rf.currState, rf.currentTerm, rf.log, args)
 
 	// init defalt
 	reply.Success = false
 	reply.Term = rf.currentTerm
 	reply.Index = len(rf.log)
 
-	// leader do not handle this msg
-	if rf.currState == StateLeader {
-		DPrintf("[raft=%-2d state=%-1d term=%-2d] handleAppendEntries error not StateLeader, replyIndex = %d", rf.me, rf.currState, rf.currentTerm, reply.Index)
+	//  Reply false if term < currentTerm
+	if args.Term < rf.currentTerm {
+		DPrintf("[raft=%-2d state=%-1d term=%-2d] handleAppendEntries error args term out date, replyIndex = %d", rf.me, rf.currState, rf.currentTerm, reply.Index)
 		return
 	}
 
-	//  Reply false if term < currentTerm
-	if args.Term < rf.currentTerm {
-		DPrintf("[raft=%-2d state=%-1d term=%-2d] handleAppendEntries error args term out date, replyIndex = %d", rf.me, rf.currState, rf.currentTerm, rf.currentTerm, reply.Index)
-		return
+	// check term
+	if args.Term > rf.currentTerm {
+		rf.termChallenge(args.Term)
+		reply.Term = rf.currentTerm
 	}
+
+	// handle event before return
+	defer func() {
+		// if Follower, just reset timer
+		// if Candidate, become(Follower)
+		// if Leader maybe, become(Follower)
+		if rf.currState == StateFollower {
+			rf.resetTimer()
+		} else {
+			rf.become(StateFollower)
+		}
+	}()
+
 
 	// Reply false if log doesn’t contain an entry at prevLogIndex
 	// whose term matches prevLogTerm
@@ -869,33 +863,28 @@ func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 	}
 
 	DPrintf("[raft=%-2d state=%-1d term=%-2d] handleAppendEntries end, after log count = %d, commitIndex = %d, replyIndex = %d,  rf.log = %v", rf.me, rf.currState, rf.currentTerm, len(rf.log), rf.commitIndex, reply.Index, rf.log)
-
-	// do step before return
-	rf.step(Event{event:EventAppendEntriesReq, term:args.Term})
 }
 
 func (rf *Raft) handleRequestVote(args *RequestVoteArgs, reply *RequestVoteReply)  {
 	rf.assertLockHeld("need locked before call handleRequestVote!")
-
-	// check term
-	rf.termChallenge(args.Term)
+	DPrintf("[raft=%-2d state=%-1d term=%-2d] handleRequestVote begin args = %v", rf.me, rf.currState, rf.currentTerm, args)
 
 	// init defalt
 	reply.VoteGranted = false
 	reply.Term = rf.currentTerm
 
-
-	// leader candidate just reject
-	if rf.currState == StateLeader || rf.currState == StateCandidate {
-		reply.VoteGranted = false
-		return
-	}
-
 	// Reply false if term < currentTerm
 	if args.Term < rf.currentTerm {
 		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
+		DPrintf("[raft=%-2d state=%-1d term=%-2d] handleRequestVote error args term out date, reply = %v", rf.me, rf.currState, rf.currentTerm, reply)
 		return
+	}
+
+	// check term
+	if args.Term > rf.currentTerm {
+		rf.termChallenge(args.Term)
+		reply.Term = rf.currentTerm
 	}
 
 	// If votedFor is null or candidateId, and candidate’s log is at
@@ -905,40 +894,31 @@ func (rf *Raft) handleRequestVote(args *RequestVoteArgs, reply *RequestVoteReply
 	// the log with the later term is more up-to-date. If the logs
 	// end with the same term, then whichever log is longer is
 	// more up-to-date.
+	lastLogIndex, lastLogTerm := rf.lastLogIndexAndTerm()
 	if rf.votedFor < 0 || rf.votedFor == args.CandidateId {
-		lastEntryIndex := len(rf.log)
-		lastEntryTerm := 0
-		if lastEntryIndex > 0 {
-			lastEntryTerm = rf.log[lastEntryIndex - 1].Term
-		}
-
-		if args.LastLogTerm > lastEntryTerm {
+		isUpToDate :=
+			args.LastLogTerm > lastLogTerm ||
+			(args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex)
+		if(isUpToDate) {
+			reply.Term = rf.currentTerm
 			reply.VoteGranted = true
-		} else if args.LastLogTerm == lastEntryTerm {
-			if args.LastLogIndex >= lastEntryIndex {
-				reply.VoteGranted = true
+			rf.votedFor = args.CandidateId
+
+			DPrintf("[raft=%-2d state=%-1d term=%-2d] handleRequestVote end true, your log is more up-to-date, reply = %v", rf.me, rf.currState, rf.currentTerm, reply)
+			// you should only restart your election timer
+			// if you grant a vote to another peer.
+			// no matter curr state is, if you vote for other, you must changeFollower
+			if rf.currState == StateFollower {
+				rf.resetTimer()
+			} else {
+				rf.become(StateFollower)
 			}
+			return
 		}
 	}
 
-	// update votedFor
-	if reply.VoteGranted == true {
-		rf.votedFor = args.CandidateId
-		// do step
-		// you should only restart your election timer
-		// if you grant a vote to another peer.
-		rf.step(Event{event:EventRequestVoteReq, term:args.Term})
-		// persist
-		rf.persist()
-	}
+	DPrintf("[raft=%-2d state=%-1d term=%-2d] handleRequestVote end false, mylog is more up-to-date, reply = %v", rf.me, rf.currState, rf.currentTerm, reply)
 }
-
-func (rf *Raft) handleReply(event Event)  {
-	rf.assertLockHeld("need locked before call handleReply!")
-	rf.termChallenge(event.term)
-	rf.step(event)
-}
-
 
 type intSlice []int
 func (p intSlice) Len() int           { return len(p) }
