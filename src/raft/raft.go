@@ -208,12 +208,21 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+
+	currentTermHasLog := rf.currentTerm == rf.term(len(rf.log))
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	if ok {
 		// recieve AppendEntries res
 		rf.doLock()
 		if rf.currentTerm == args.Term {
-			rf.handleReply(Event{event:EventAppendEntriesRes, success:reply.Success, term:reply.Term, peer:server, index:reply.Index})
+			rf.handleReply(
+				Event{
+				event:EventAppendEntriesRes,
+				success:reply.Success,
+				term:reply.Term,
+				peer:server,
+				index:reply.Index,
+				currentTermHasLog:currentTermHasLog})
 		}
 		rf.doUnlock()
 	}
@@ -398,7 +407,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.persist()
 
 		// check commit
-		rf.leaderMaybeCommit()
+		// rf.leaderMaybeCommit(true)
 
 		DPrintf("[raft=%-2d state=%-1d term=%-2d] log recieve, entry = %v!", rf.me, rf.currState, rf.currentTerm, entry)
 
@@ -505,6 +514,7 @@ type Event struct {
 
 	// for app reply
 	index 	int
+	currentTermHasLog 	bool
 }
 
 type StateStep 			func (Event)
@@ -715,7 +725,7 @@ func (rf *Raft) stepLeader(event Event)  {
 			rf.matchIndex[event.peer] = event.index
 			rf.nextIndex[event.peer] = event.index + 1
 
-			if rf.leaderMaybeCommit() {
+			if rf.leaderMaybeCommit(event.currentTermHasLog) {
 				// too many rpcs need this?
 				// rf.bcastAppendEntries()
 			}
@@ -940,7 +950,11 @@ func (p intSlice) Swap(i, j int)      { p[i], p[j] = p[j], p[i] }
  * of matchIndex[i] ≥ N, and log[N].term == currentTerm:
  * set commitIndex = N
  */
-func (rf *Raft) leaderMaybeCommit() bool {
+func (rf *Raft) leaderMaybeCommit(currentTermHasLog bool) bool {
+	if !currentTermHasLog {
+		return false
+	}
+
 	mis := make(intSlice, 0, len(rf.peers))
 	for p := range rf.peers {
 		mis = append(mis, rf.matchIndex[p])
