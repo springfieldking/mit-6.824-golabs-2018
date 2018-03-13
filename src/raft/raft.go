@@ -212,8 +212,9 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	if ok {
 		// recieve AppendEntries res
 		rf.doLock()
-		targetIndex := reply.Index
-		rf.handleReply(Event{event:EventAppendEntriesRes, success:reply.Success, term:reply.Term, peer:server, index:targetIndex})
+		if rf.currentTerm == args.Term {
+			rf.handleReply(Event{event:EventAppendEntriesRes, success:reply.Success, term:reply.Term, peer:server, index:reply.Index})
+		}
 		rf.doUnlock()
 	}
 	return ok
@@ -326,7 +327,9 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	if ok {
 		// recieve AppendEntries res
 		rf.doLock()
-		rf.handleReply(Event{event:EventRequestVoteRes, success:reply.VoteGranted, term:reply.Term, peer:server})
+		if rf.currentTerm == args.Term {
+			rf.handleReply(Event{event:EventRequestVoteRes, success:reply.VoteGranted, term:reply.Term, peer:server})
+		}
 		rf.doUnlock()
 	}
 	return ok
@@ -723,7 +726,7 @@ func (rf *Raft) stepLeader(event Event)  {
 			if rf.nextIndex[event.peer] != nextIndex {
 				rf.nextIndex[event.peer] = nextIndex
 				// too many rpcs need this?
-				// rf.sendAppendEntries2peer(event.peer)
+				rf.sendAppendEntries2peer(event.peer)
 			}
 		}
 	default:
