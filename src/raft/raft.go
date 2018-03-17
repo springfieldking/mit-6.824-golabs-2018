@@ -92,13 +92,14 @@ type Raft struct {
 
 	// Other volatile state
 	currState 			StateType
-	voteCount			int
+	votes 				map[int]bool
 	// event channel
 	eventCh 			chan EventType
 	// ApplyMsg channel
 	applyCh 			chan ApplyMsg
 	// timer
 	timers 				[]*time.Timer
+	ticker				*time.Ticker
 	// state func
 	steps   			[]StateStep
 	becomes 			[]StateBecome
@@ -381,20 +382,12 @@ func (rf *Raft) bcastRequestVote() {
 						// and then check term
 						DPrintf("[raft=%-2d state=%-1d term=%-2d] handleRequestVoteRes reply = %v", rf.me, rf.currState, rf.currentTerm, reply)
 						if rf.currState == StateCandidate && rf.currentTerm == args.Term && rf.termChallenge(reply.Term) {
-							if reply.VoteGranted {
-								DPrintf("[raft=%-2d state=%-1d term=%-2d] handleRequestVoteRes, add vote!", rf.me, rf.currState, rf.currentTerm)
-								rf.voteCount ++
-								if rf.voteCount == rf.q() {
-									DPrintf("[raft=%-2d state=%-1d term=%-2d] handleRequestVoteRes got enough vote, become(StateLeader)!", rf.me, rf.currState, rf.currentTerm)
-									rf.become(StateLeader)
-								}
-							} else {
-								DPrintf("[raft=%-2d state=%-1d term=%-2d] handleRequestVoteRes, do nothing!", rf.me, rf.currState, rf.currentTerm)
-								if reply.Term > rf.currentTerm {
-									/* become before step
-									rf.become(StateFollower)
-									*/
-								}
+							gr := rf.poll(peer, reply.VoteGranted)
+							switch rf.q() {
+							case gr:
+								rf.become(StateLeader)
+							case len(rf.votes) - gr:
+								rf.become(StateFollower)
 							}
 						}
 					}
@@ -499,12 +492,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// init apply chan
 	rf.applyCh = applyCh
 
-	// start a background
-	go rf.background()
-
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
+	// start a background
+	rf.background()
 
 	return rf
 }
@@ -557,13 +549,39 @@ func (rf *Raft) background() {
 	// init event channel
 	rf.eventCh = make(chan EventType)
 
+	// init log
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+
+	// init state handler
+	rf.steps = []StateStep{rf.stepFollower, rf.stepCandidate, rf.stepLeader}
+	rf.becomes = []StateBecome{rf.becomeFollower, rf.becomeCandidate, rf.becomeLeader}
+
 	// init timer
 	rf.timers = []*time.Timer{time.NewTimer(0), time.NewTimer(0), time.NewTimer(0)}
 	for _, timer := range rf.timers {
 		timer.Stop()
 	}
 
-	// channel watch
+	// init ticker
+	tick := time.NewTicker(1 * time.Millisecond)
+
+	// init state
+	rf.doLock()
+	DPrintf("[raft=%-2d state=%-1d term=%-2d] first init, become(StateFollower)!", rf.me, rf.currState, rf.currentTerm)
+	rf.become(StateFollower)
+	rf.doUnlock()
+
+	// applier bg
+	go func() {
+		for {
+			select {
+			case <-tick.C:
+				rf.applyToCommmit()
+			}
+		}
+	}()
+
+	// channel watch gb
 	go func() {
 		for {
 			select {
@@ -577,37 +595,26 @@ func (rf *Raft) background() {
 		}
 	}()
 
-	// init state handler
-	rf.steps = []StateStep{rf.stepFollower, rf.stepCandidate, rf.stepLeader}
-	rf.becomes = []StateBecome{rf.becomeFollower, rf.becomeCandidate, rf.becomeLeader}
+	// state machine loop bg
+	go func() {
+		for {
+			event := <- rf.eventCh
+			if event == EventShutDown {
+				return
+			}
 
-	// init log
-	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-
-	// init state
-	rf.doLock()
-	DPrintf("[raft=%-2d state=%-1d term=%-2d] first init, become(StateFollower)!", rf.me, rf.currState, rf.currentTerm)
-	rf.become(StateFollower)
-	rf.doUnlock()
-
-	// state machine loop
-	for {
-		event := <- rf.eventCh
-		if event == EventShutDown {
-			return
+			rf.doLock()
+			rf.step(Event{event:event})
+			rf.doUnlock()
 		}
-
-		rf.doLock()
-		rf.step(Event{event:event})
-		rf.doUnlock()
-	}
+	}()
 }
 
 func (rf *Raft) q() int { return len(rf.peers)/2 + 1 }
 
 func (rf *Raft) reset()  {
 	rf.votedFor = -1
-	rf.voteCount = 0
+	rf.votes = make(map[int]bool)
 }
 
 func (rf *Raft) step(event Event)  {
@@ -669,7 +676,8 @@ func (rf *Raft) becomeCandidate()  {
 	// vote for self
 	rf.votedFor = rf.me
 	// reset voteCount
-	rf.voteCount = 1
+	// vote for me
+	rf.poll(rf.me, true)
 	// reset election timer
 	rf.resetTimer();
 
@@ -772,11 +780,14 @@ func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 		reply.Term = rf.currentTerm
 	}
 
+	if rf.currState == StateLeader {
+		panic("one Term must has one leader !!!!!")
+	}
+
 	// handle event before return
 	defer func() {
 		// if Follower, just reset timer
 		// if Candidate, become(Follower)
-		// if Leader maybe, become(Follower)
 		if rf.currState == StateFollower {
 			rf.resetTimer()
 		} else {
@@ -887,6 +898,12 @@ func (rf *Raft) handleRequestVote(args *RequestVoteArgs, reply *RequestVoteReply
 		reply.Term = rf.currentTerm
 	}
 
+	// Candidate & Leader vote false
+	if rf.currState == StateCandidate || rf.currState == StateLeader {
+		return
+	}
+
+
 	// If votedFor is null or candidateId, and candidate’s log is at
 	// least as up-to-date as receiver’s log, grant vote
 
@@ -903,16 +920,11 @@ func (rf *Raft) handleRequestVote(args *RequestVoteArgs, reply *RequestVoteReply
 			reply.Term = rf.currentTerm
 			reply.VoteGranted = true
 			rf.votedFor = args.CandidateId
-
 			DPrintf("[raft=%-2d state=%-1d term=%-2d] handleRequestVote end true, your log is more up-to-date, reply = %v", rf.me, rf.currState, rf.currentTerm, reply)
+			// persist
+			rf.persist()
 			// you should only restart your election timer
-			// if you grant a vote to another peer.
-			// no matter curr state is, if you vote for other, you must changeFollower
-			if rf.currState == StateFollower {
-				rf.resetTimer()
-			} else {
-				rf.become(StateFollower)
-			}
+			rf.resetTimer()
 			return
 		}
 	}
@@ -954,7 +966,7 @@ func (rf *Raft) leaderMaybeCommit(currentTermHasLog bool) bool {
 func (rf *Raft) commitTo(to int) {
 	DPrintf("[raft=%-2d state=%-1d term=%-2d] log commit, commmit index = %d!", rf.me, rf.currState, rf.currentTerm, to)
 	rf.commitIndex = to
-	rf.applyToCommmit()
+	//rf.applyToCommmit()
 }
 
 /**
@@ -962,21 +974,50 @@ func (rf *Raft) commitTo(to int) {
  *	log[lastApplied] to state machine
  */
 func (rf *Raft) applyToCommmit() {
+	lastApplied := rf.lastApplied
+	commitIndex := rf.commitIndex
 
 	// check
-	if rf.lastApplied > rf.commitIndex {
+	if lastApplied > commitIndex {
 		panic("lastApplied > commitIndex")
 	}
 
+	// already applied
+	if lastApplied == commitIndex {
+		return
+	}
+
+	// do apply
+	applyMsg := ApplyMsg{false, 0, 0}
+	rf.doLock()
 	for tmp := rf.lastApplied + 1; tmp <= rf.commitIndex; tmp ++ {
 		// do apply
 		rf.lastApplied = tmp
 
 		// apply msg to client
 		arrIndex := rf.lastApplied - 1
-		applyMsg := ApplyMsg{true, rf.log[arrIndex].Command, rf.log[arrIndex].Index}
+		applyMsg = ApplyMsg{true, rf.log[arrIndex].Command, rf.log[arrIndex].Index}
 		DPrintf("[raft=%-2d state=%-1d term=%-2d] log apply, entry = %v!", rf.me, rf.currState, rf.currentTerm, rf.log[arrIndex])
 
+		// apply one log per tick
+		break
+	}
+	rf.doUnlock()
+
+	// channel
+	if applyMsg.CommandValid {
 		rf.applyCh <- applyMsg
 	}
+}
+
+func (rf *Raft) poll(id int, v bool) (granted int) {
+	if _, ok := rf.votes[id]; !ok {
+		rf.votes[id] = v
+	}
+	for _, vv := range rf.votes {
+		if vv {
+			granted++
+		}
+	}
+	return granted
 }
