@@ -2,12 +2,18 @@ package raftkv
 
 import "labrpc"
 import "crypto/rand"
-import "math/big"
+import (
+	"math/big"
+	"sync"
+)
 
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
+	mu        sync.Mutex
+	sessionId int64
+	requestId uint32
 }
 
 func nrand() int64 {
@@ -21,6 +27,8 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
+	ck.sessionId = nrand()
+	ck.requestId = 0;
 	return ck
 }
 
@@ -39,6 +47,23 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 func (ck *Clerk) Get(key string) string {
 
 	// You will have to modify this function.
+	ck.mu.Lock()
+	ck.requestId++
+	args := GetArgs{key, ck.sessionId, ck.requestId}
+	reply := GetReply{}
+	ck.mu.Unlock()
+
+	//
+	for {
+		for server := range ck.servers {
+			if ok := ck.servers[server].Call("KVServer.Get", &args, &reply); ok {
+				if reply.Err == OK {
+					return reply.Value
+				}
+			}
+		}
+	}
+
 	return ""
 }
 
@@ -54,6 +79,21 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+	ck.mu.Lock()
+	ck.requestId++
+	args := PutAppendArgs{key, value, op, ck.sessionId, ck.requestId}
+	reply := PutAppendReply{}
+	ck.mu.Unlock()
+
+	for {
+		for server := range ck.servers {
+			if ok := ck.servers[server].Call("KVServer.PutAppend", &args, &reply); ok {
+				if reply.Err == OK {
+					return
+				}
+			}
+		}
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {

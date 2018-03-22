@@ -56,6 +56,7 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
+	CommandTerm  int
 }
 
 type LogEntry struct {
@@ -440,7 +441,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		DPrintf("[raft=%-2d state=%-1d term=%-2d] log recieve, entry = %v!", rf.me, rf.currState, rf.currentTerm, entry)
 
 		// todo too many rpcs need bcast?
-		// rf.bcastAppendEntries()
+		rf.bcastAppendEntries()
 	}
 
 	rf.doUnlock()
@@ -988,7 +989,7 @@ func (rf *Raft) applyToCommmit() {
 	}
 
 	// do apply
-	applyMsg := ApplyMsg{false, 0, 0}
+	applyMsg := ApplyMsg{false, 0, 0,0}
 	rf.doLock()
 	for tmp := rf.lastApplied + 1; tmp <= rf.commitIndex; tmp ++ {
 		// do apply
@@ -996,7 +997,7 @@ func (rf *Raft) applyToCommmit() {
 
 		// apply msg to client
 		arrIndex := rf.lastApplied - 1
-		applyMsg = ApplyMsg{true, rf.log[arrIndex].Command, rf.log[arrIndex].Index}
+		applyMsg = ApplyMsg{true, rf.log[arrIndex].Command, rf.log[arrIndex].Index, rf.log[arrIndex].Term}
 		DPrintf("[raft=%-2d state=%-1d term=%-2d] log apply, entry = %v!", rf.me, rf.currState, rf.currentTerm, rf.log[arrIndex])
 
 		// apply one log per tick
