@@ -58,9 +58,6 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// ret
 	reply.Err = ret
 	if reply.Err != OK {
-		if reply.Err == ErrWrongLeader {
-			reply.WrongLeader = true
-		}
 		DPrintf("[server=%-2d] args=%v reply=%v", kv.me, args, reply)
 		return
 	}
@@ -86,52 +83,43 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 	// check args
 	if args.Op != OpPut && args.Op != OpAppend {
-		reply.Err = ErrCommand
+		// i can not handle this command, try other server
+		reply.Err = FaultWrongLeader
 		DPrintf("[server=%-2d] args=%v reply=%v", kv.me, args, reply)
 		return
 	}
 
 	// execute
-	ret := kv.execute(args.SessionId, args.RequestId, Op{args.Op,args.Key,args.Value})
+	reply.Err = kv.execute(args.SessionId, args.RequestId, Op{args.Op,args.Key,args.Value})
 
-	// ret
-	reply.Err = ret
-	if reply.Err == ErrWrongLeader {
-		reply.WrongLeader = true
-	}
 	DPrintf("[server=%-2d] args=%v reply=%v", kv.me, args, reply)
-}
-
-func (kv *KVServer) safeStart(sessionId int64, requestId uint32, op Op) (Err, int, int) {
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-
-	if kv.history[sessionId] >= requestId {
-		return ErrDupReq, 0, 0
-	}
-
-	index, term, isLeader := kv.rf.Start(op)
-	if !isLeader {
-		return ErrWrongLeader, index, term
-	}
-
-	kv.history[sessionId] = requestId
-	return OK, index, term
 }
 
 func (kv *KVServer) execute(sessionId int64, requestId uint32, op Op) Err {
 
-	// start cmd
-	ret, index, term := kv.safeStart(sessionId, requestId, op)
-	if ret != OK {
-		return ret
+	kv.mu.Lock()
+
+	// check req
+	if kv.history[sessionId] >= requestId {
+		kv.mu.Unlock()
+		return OK
 	}
+
+	// check leader
+	index, term, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		kv.mu.Unlock()
+		return FaultWrongLeader
+	}
+
+	// set req history
+	kv.history[sessionId] = requestId
 
 	// create index chan for wait
 	applyC := make(chan raft.ApplyMsg)
-	kv.mu.Lock()
 	kv.indexChan[index] = applyC
 	kv.mu.Unlock()
+
 
 	// destroy chan before return
 	defer func() {
@@ -145,14 +133,14 @@ func (kv *KVServer) execute(sessionId int64, requestId uint32, op Op) Err {
 	var msg raft.ApplyMsg
 	select {
 	case msg = <-applyC:
-		// do nothing
+		// check term
+		if msg.CommandTerm != term {
+			// leader changed maybe
+			return FaultWrongLeader
+		}
 	case <-time.After(time.Second):
-		return ErrTimeout
-	}
-
-	// check term
-	if msg.CommandTerm != term {
-		return ErrTermout
+		// leader changed maybe
+		return FaultWrongLeader
 	}
 
 	return OK

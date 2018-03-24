@@ -12,6 +12,7 @@ type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
 	mu        sync.Mutex
+	leader	  uint32
 	sessionId int64
 	requestId uint32
 }
@@ -28,8 +29,15 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck.servers = servers
 	// You'll have to add code here.
 	ck.sessionId = nrand()
-	ck.requestId = 0;
+	ck.requestId = 0
+	ck.leader = 0
 	return ck
+}
+
+func (ck *Clerk) setLastLeader(leader uint32) {
+	ck.mu.Lock()
+	ck.leader = leader
+	ck.mu.Unlock()
 }
 
 //
@@ -51,15 +59,28 @@ func (ck *Clerk) Get(key string) string {
 	ck.requestId++
 	args := GetArgs{key, ck.sessionId, ck.requestId}
 	reply := GetReply{}
+	leader := ck.leader
 	ck.mu.Unlock()
 
 	//
 	for {
-		for server := range ck.servers {
-			if ok := ck.servers[server].Call("KVServer.Get", &args, &reply); ok {
-				if reply.Err == OK {
-					return reply.Value
-				}
+		server := ck.servers[leader]
+		if ok := server.Call("KVServer.Get", &args, &reply); ok {
+			if reply.Err == FaultWrongLeader {
+				leader ++
+				leader = leader % uint32(len(ck.servers))
+				continue
+			}
+
+			ck.setLastLeader(leader)
+
+			switch reply.Err {
+			case OK:
+				return reply.Value
+			case ErrNoKey:
+				return ""
+			default:
+				continue
 			}
 		}
 	}
@@ -83,14 +104,25 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	ck.requestId++
 	args := PutAppendArgs{key, value, op, ck.sessionId, ck.requestId}
 	reply := PutAppendReply{}
+	leader := ck.leader
 	ck.mu.Unlock()
 
 	for {
-		for server := range ck.servers {
-			if ok := ck.servers[server].Call("KVServer.PutAppend", &args, &reply); ok {
-				if reply.Err == OK {
-					return
-				}
+		server := ck.servers[leader]
+		if ok := server.Call("KVServer.PutAppend", &args, &reply); ok {
+			if reply.Err == FaultWrongLeader {
+				leader ++
+				leader = leader % uint32(len(ck.servers))
+				continue
+			}
+
+			ck.setLastLeader(leader)
+
+			switch reply.Err {
+			case OK:
+				return
+			default:
+				continue
 			}
 		}
 	}
