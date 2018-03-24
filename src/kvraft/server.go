@@ -32,6 +32,9 @@ type Op struct {
 	Type	string
 	Key 	string
 	Val 	string
+
+	SessionId int64
+	RequestId uint32
 }
 
 type KVServer struct {
@@ -53,7 +56,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
 
 	// execute
-	ret := kv.execute(args.SessionId, args.RequestId, Op{OpGet,"",""})
+	ret := kv.execute(args.SessionId, args.RequestId, Op{OpGet,"","", args.SessionId, args.RequestId})
 
 	// ret
 	reply.Err = ret
@@ -90,7 +93,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	}
 
 	// execute
-	reply.Err = kv.execute(args.SessionId, args.RequestId, Op{args.Op,args.Key,args.Value})
+	reply.Err = kv.execute(args.SessionId, args.RequestId, Op{args.Op,args.Key,args.Value, args.SessionId, args.RequestId})
 
 	DPrintf("[server=%-2d] args=%v reply=%v", kv.me, args, reply)
 }
@@ -111,9 +114,6 @@ func (kv *KVServer) execute(sessionId int64, requestId uint32, op Op) Err {
 		kv.mu.Unlock()
 		return FaultWrongLeader
 	}
-
-	// set req history
-	kv.history[sessionId] = requestId
 
 	// create index chan for wait
 	applyC := make(chan raft.ApplyMsg)
@@ -194,6 +194,19 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 }
 
 func (kv *KVServer) readApplyC(applyC <-chan raft.ApplyMsg) {
+
+	doNotify := func(index int, msg raft.ApplyMsg) {
+		// get index chan
+		kv.mu.Lock()
+		indexChan, ok := kv.indexChan[index]
+		kv.mu.Unlock()
+
+		// notify
+		if ok {
+			indexChan <- msg
+		}
+	}
+
 	for msg := range applyC {
 
 		if !msg.CommandValid {
@@ -201,6 +214,22 @@ func (kv *KVServer) readApplyC(applyC <-chan raft.ApplyMsg) {
 		}
 
 		if op, ok := msg.Command.(Op); ok {
+			sessionId := op.SessionId
+			requestId := op.RequestId
+			index 	  := msg.CommandIndex
+
+			// check req has applied
+			kv.mu.Lock()
+			hasApplied := kv.history[sessionId] >= requestId
+			kv.mu.Unlock()
+
+			// if has applied, notify and skip
+			if hasApplied {
+				doNotify(index, msg)
+				continue
+			}
+
+			// if has not applied, do apply and notify
 			kv.mu.Lock()
 			// apply log
 			switch op.Type {
@@ -212,15 +241,12 @@ func (kv *KVServer) readApplyC(applyC <-chan raft.ApplyMsg) {
 				kv.kvStore[op.Key] += op.Val
 			}
 
-			// get index chan
-			index := msg.CommandIndex
-			indexChan, ok := kv.indexChan[index]
+			// set req history
+			kv.history[sessionId] = requestId
 			kv.mu.Unlock()
 
-			// notify
-			if ok {
-				indexChan <- msg
-			}
+			// do notify
+			doNotify(index, msg)
 		}
 	}
 }
