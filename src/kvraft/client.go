@@ -65,24 +65,24 @@ func (ck *Clerk) Get(key string) string {
 	//
 	for {
 		server := ck.servers[leader]
-		if ok := server.Call("KVServer.Get", &args, &reply); ok {
-			if reply.Err == FaultWrongLeader {
-				leader ++
-				leader = leader % uint32(len(ck.servers))
-				continue
-			}
-
-			ck.setLastLeader(leader)
-
-			switch reply.Err {
-			case OK:
-				return reply.Value
-			case ErrNoKey:
-				return ""
-			default:
-				continue
-			}
+		ok := server.Call("KVServer.Get", &args, &reply);
+		if !ok || reply.Err == FaultWrongLeader {
+			leader ++
+			leader = leader % uint32(len(ck.servers))
+			continue
 		}
+
+		ck.setLastLeader(leader)
+
+		switch reply.Err {
+		case OK:
+			return reply.Value
+		case ErrNoKey:
+			return ""
+		default:
+			continue
+		}
+
 	}
 
 	return ""
@@ -109,22 +109,22 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 
 	for {
 		server := ck.servers[leader]
-		if ok := server.Call("KVServer.PutAppend", &args, &reply); ok {
-			if reply.Err == FaultWrongLeader {
-				leader ++
-				leader = leader % uint32(len(ck.servers))
-				continue
-			}
-
-			ck.setLastLeader(leader)
-
-			switch reply.Err {
-			case OK:
-				return
-			default:
-				continue
-			}
+		ok := server.Call("KVServer.PutAppend", &args, &reply);
+		if !ok || reply.Err == FaultWrongLeader {
+			leader ++
+			leader = leader % uint32(len(ck.servers))
+			continue
 		}
+
+		ck.setLastLeader(leader)
+
+		switch reply.Err {
+		case OK:
+			return
+		default:
+			continue
+		}
+
 	}
 }
 

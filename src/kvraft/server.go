@@ -55,13 +55,14 @@ type KVServer struct {
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
 
+	defer DPrintf("[server=%-2d] Get, args=%v, reply=%v", kv.me, args, reply)
+
 	// execute
 	ret := kv.execute(args.SessionId, args.RequestId, Op{OpGet,"","", args.SessionId, args.RequestId})
 
 	// ret
 	reply.Err = ret
 	if reply.Err != OK {
-		DPrintf("[server=%-2d] args=%v reply=%v", kv.me, args, reply)
 		return
 	}
 
@@ -77,25 +78,22 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	} else {
 		reply.Err = ErrNoKey
 	}
-
-	DPrintf("[server=%-2d] args=%v reply=%v", kv.me, args, reply)
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
 
+	defer DPrintf("[server=%-2d] PutAppend, args=%v, reply=%v", kv.me, args, reply)
+
 	// check args
 	if args.Op != OpPut && args.Op != OpAppend {
 		// i can not handle this command, try other server
 		reply.Err = FaultWrongLeader
-		DPrintf("[server=%-2d] args=%v reply=%v", kv.me, args, reply)
 		return
 	}
 
 	// execute
 	reply.Err = kv.execute(args.SessionId, args.RequestId, Op{args.Op,args.Key,args.Value, args.SessionId, args.RequestId})
-
-	DPrintf("[server=%-2d] args=%v reply=%v", kv.me, args, reply)
 }
 
 func (kv *KVServer) execute(sessionId int64, requestId uint32, op Op) Err {
@@ -120,6 +118,7 @@ func (kv *KVServer) execute(sessionId int64, requestId uint32, op Op) Err {
 	kv.indexChan[index] = applyC
 	kv.mu.Unlock()
 
+	DPrintf("[server=%-2d] execute start, op=%v", kv.me, op)
 
 	// destroy chan before return
 	defer func() {
@@ -136,13 +135,16 @@ func (kv *KVServer) execute(sessionId int64, requestId uint32, op Op) Err {
 		// check term
 		if msg.CommandTerm != term {
 			// leader changed maybe
+			DPrintf("[server=%-2d] execute fail, term out, op=%v", kv.me, op)
 			return FaultWrongLeader
 		}
 	case <-time.After(time.Second):
 		// leader changed maybe
+		DPrintf("[server=%-2d] execute fail, time out, op=%v", kv.me, op)
 		return FaultWrongLeader
 	}
 
+	DPrintf("[server=%-2d] execute end, time out, op=%v", kv.me, op)
 	return OK
 }
 
@@ -203,6 +205,7 @@ func (kv *KVServer) readApplyC(applyC <-chan raft.ApplyMsg) {
 
 		// notify
 		if ok {
+			DPrintf("[server=%-2d] apply msg=%v", kv.me, msg)
 			indexChan <- msg
 		}
 	}
