@@ -7,6 +7,7 @@ import (
 	"raft"
 	"sync"
 	"time"
+	"bytes"
 )
 
 const Debug = 0
@@ -123,7 +124,7 @@ func (kv *KVServer) execute(sessionId int64, requestId uint32, op Op) Err {
 	// destroy chan before return
 	defer func() {
 		kv.mu.Lock()
-		close(kv.indexChan[index])
+		// close(kv.indexChan[index])
 		delete(kv.indexChan, index)
 		kv.mu.Unlock()
 	}()
@@ -190,6 +191,11 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.kvStore = make(map[string]string)
 	kv.history = make(map[int64]uint32)
 	kv.indexChan = make(map[int]chan raft.ApplyMsg)
+
+	// read snapshot
+	// kv.readSnapshot()
+
+	// start bg
 	go kv.readApplyC(kv.applyCh)
 
 	return kv
@@ -213,6 +219,13 @@ func (kv *KVServer) readApplyC(applyC <-chan raft.ApplyMsg) {
 	for msg := range applyC {
 
 		if !msg.CommandValid {
+			continue
+		}
+
+		if msg.CommandIsSnapShot {
+			if data, ok := msg.Command.([]byte); ok {
+				kv.restoreSnapshot(data)
+			}
 			continue
 		}
 
@@ -250,6 +263,42 @@ func (kv *KVServer) readApplyC(applyC <-chan raft.ApplyMsg) {
 
 			// do notify
 			doNotify(index, msg)
+
+			if 0 < kv.maxraftstate && int(float32(kv.maxraftstate) * float32(0.8)) <= kv.rf.GetRaftStateSize() {
+				kv.saveSnapshot(index)
+			}
 		}
+	}
+}
+
+func (kv *KVServer) saveSnapshot(index int) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.kvStore)
+	e.Encode(kv.history)
+	data := w.Bytes()
+
+	kv.rf.SaveSnapshot(index, data)
+}
+
+func (kv *KVServer) restoreSnapshot(data []byte) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	if data == nil || len(data) < 1 {
+		// bootstrap without any state?
+		kv.kvStore = make(map[string]string)
+		return
+	}
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	if d.Decode(&kv.kvStore) != nil ||
+		d.Decode(&kv.history) != nil {
+		panic("readSnapshot decode error !")
 	}
 }
