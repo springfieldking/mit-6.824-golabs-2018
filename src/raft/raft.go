@@ -509,43 +509,10 @@ func (rf *Raft) SaveSnapshot(index int, data []byte) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	if index <= rf.snapshotIndex {
-		return
-	}
-
 	DPrintf("[raft=%-2d state=%-1d term=%-2d] SaveSnapshot index = %d", rf.me, rf.currState, rf.currentTerm, index)
 
-	rf.log = rf.log[index - rf.snapshotIndex: rf.lastLogIndex() - rf.snapshotIndex]
-
 	term := rf.term(index)
-	rf.snapshotIndex = index
-	rf.snapshotTerm = term
-	rf.snapshot = data
-
-	if rf.commitIndex < rf.snapshotIndex {
-		rf.commitIndex = rf.snapshotIndex
-	}
-
-	if rf.lastApplied < rf.snapshotIndex {
-		rf.lastApplied = rf.snapshotIndex - 1
-	}
-
-	// SaveStateAndSnapshot
-	wState := new(bytes.Buffer)
-	eState := labgob.NewEncoder(wState)
-	eState.Encode(rf.currentTerm)
-	eState.Encode(rf.votedFor)
-	eState.Encode(rf.log)
-	state := wState.Bytes()
-
-	wSnapshot := new(bytes.Buffer)
-	eSnapshot := labgob.NewEncoder(wSnapshot)
-	eSnapshot.Encode(rf.snapshotIndex)
-	eSnapshot.Encode(rf.snapshotTerm)
-	eSnapshot.Encode(rf.snapshot)
-	snapshot := wSnapshot.Bytes()
-
-	rf.persister.SaveStateAndSnapshot(state, snapshot)
+	rf.doInstallSnap(index, term, data)
 }
 
 func (rf *Raft) readSnapshot(data []byte) {
@@ -1118,19 +1085,23 @@ func (rf *Raft) handleInstallSnap(args *InstallSnapshotArgs, reply *InstallSnaps
 		reply.Term = rf.currentTerm
 	}
 
-	if args.LastIncludedIndex <= rf.snapshotIndex {
+	rf.doInstallSnap(args.LastIncludedIndex, args.LastIncludedTerm, args.Data)
+}
+
+func (rf *Raft) doInstallSnap(index int, term int, data []byte) {
+	if index <= rf.snapshotIndex {
 		return
 	}
 
-	if args.LastIncludedIndex >= rf.lastLogIndex() {
+	if index >= rf.lastLogIndex() {
 		rf.log = []LogEntry{}
 	} else {
-		rf.log = rf.log[args.LastIncludedIndex - rf.snapshotIndex: rf.lastLogIndex() - rf.snapshotIndex]
+		rf.log = rf.log[index - rf.snapshotIndex: rf.lastLogIndex() - rf.snapshotIndex]
 	}
 
-	rf.snapshotIndex = args.LastIncludedIndex
-	rf.snapshotTerm = args.LastIncludedTerm
-	rf.snapshot = args.Data
+	rf.snapshotIndex = index
+	rf.snapshotTerm = term
+	rf.snapshot = data
 
 	if rf.commitIndex < rf.snapshotIndex {
 		rf.commitIndex = rf.snapshotIndex
@@ -1157,6 +1128,7 @@ func (rf *Raft) handleInstallSnap(args *InstallSnapshotArgs, reply *InstallSnaps
 
 	rf.persister.SaveStateAndSnapshot(state, snapshot)
 }
+
 
 type intSlice []int
 func (p intSlice) Len() int           { return len(p) }
