@@ -509,6 +509,10 @@ func (rf *Raft) SaveSnapshot(index int, data []byte) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	if index <= rf.snapshotIndex {
+		return
+	}
+
 	DPrintf("[raft=%-2d state=%-1d term=%-2d] SaveSnapshot index = %d", rf.me, rf.currState, rf.currentTerm, index)
 
 	term := rf.term(index)

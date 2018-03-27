@@ -264,7 +264,7 @@ func (kv *KVServer) readApplyC(applyC <-chan raft.ApplyMsg) {
 			// do notify
 			doNotify(index, msg)
 
-			if 0 < kv.maxraftstate && int(float32(kv.maxraftstate) * float32(0.8)) <= kv.rf.GetRaftStateSize() {
+			if 0 < kv.maxraftstate && int(float32(kv.maxraftstate) * float32(0.5)) <= kv.rf.GetRaftStateSize() {
 				kv.saveSnapshot(index)
 			}
 		}
