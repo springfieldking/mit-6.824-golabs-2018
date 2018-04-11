@@ -256,7 +256,9 @@ func (rf *Raft) sendAppendEntries2peer(p int) {
 		 */
 		lastLogIndex := rf.lastLogIndex()
 		if nextLogIndex <= lastLogIndex {
-			entries = rf.log[nextLogIndex - rf.snapshotIndex - 1:lastLogIndex - rf.snapshotIndex]
+			tmpEntries := rf.log[nextLogIndex - rf.snapshotIndex - 1:lastLogIndex - rf.snapshotIndex]
+			entries = make([]LogEntry, len(tmpEntries))
+			copy(entries, tmpEntries)
 		}
 
 		// has curr term log
