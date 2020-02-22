@@ -12,7 +12,7 @@ import (
 
 const Debug = 0
 
-func DPrintf(format string, a ...interface{}) (n int, err error) {
+func DPrintf(format string, a ...interface{}) {
 	if Debug > 0 {
 		log.Printf(format, a...)
 	}
@@ -145,7 +145,7 @@ func (kv *KVServer) execute(sessionId int64, requestId uint32, op Op) Err {
 		return FaultWrongLeader
 	}
 
-	DPrintf("[server=%-2d] execute end, time out, op=%v", kv.me, op)
+	DPrintf("[server=%-2d] execute end, op=%v", kv.me, op)
 	return OK
 }
 
