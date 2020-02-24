@@ -2,17 +2,32 @@ package shardkv
 
 
 // import "shardmaster"
-import "labrpc"
+import (
+	"bytes"
+	"labrpc"
+	"log"
+	"time"
+)
 import "raft"
 import "sync"
 import "labgob"
 
-
+const (
+	OpGet  		= "Get"
+	OpPut		= "Put"
+	OpAppend	= "Append"
+)
 
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	SessionId 	int64
+	RequestId 	uint32
+
+	Type	string
+	Key 	string
+	Val 	string
 }
 
 type ShardKV struct {
@@ -26,15 +41,103 @@ type ShardKV struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	kvStore  	map[string]string 	// current committed key-value pairs
+	history     map[int64]uint32 	// client session map to committed requestID
+	noticeChan 	map[int] chan raft.ApplyMsg
 }
 
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	isLeader, err := kv.exec(Op{
+		SessionId: args.SessionId,
+		RequestId: args.RequestId,
+		Type: OpGet,
+		Key: args.Key,
+	})
+
+	reply.WrongLeader = !isLeader
+	reply.Err = err
+
+	// get value
+	if err == OK {
+		kv.mu.Lock()
+		v, ok := kv.kvStore[args.Key]; if ok {
+			reply.Value = v
+		}
+		kv.mu.Unlock()
+	}
 }
 
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	isLeader, err := kv.exec(Op{
+		SessionId: args.SessionId,
+		RequestId: args.RequestId,
+		Type: args.Op,
+		Val: args.Value,
+		Key: args.Key,
+	})
+
+
+	reply.WrongLeader = !isLeader
+	reply.Err = err
+}
+
+func (kv *ShardKV) exec(op Op) (isLeader bool, err Err) {
+	// Your code here.
+	kv.mu.Lock()
+
+	// check req
+	if kv.history[op.SessionId] >= op.RequestId {
+		kv.mu.Unlock()
+		DPrintf("[server=%-2d] repeated call return %v", kv.me, op)
+		return true, OK
+	}
+
+	var index, term int
+
+	index, term, isLeader = kv.rf.Start(op)
+	if !isLeader {
+		err = ErrWrongLeader
+		kv.mu.Unlock()
+		return
+	}
+
+	// create index chan for wait
+	noticeCh := make(chan raft.ApplyMsg)
+	kv.noticeChan[index] = noticeCh
+	kv.mu.Unlock()
+
+	defer DPrintf("[server=%-2d] exec op=%v index=%v term=%v", kv.me, op, index, term)
+
+	// destroy chan before return
+	defer func() {
+		kv.mu.Lock()
+		delete(kv.noticeChan, index)
+		kv.mu.Unlock()
+	}()
+
+
+	// wait apply msg
+	var msg raft.ApplyMsg
+	select {
+	case msg = <-noticeCh:
+		// check term
+		if msg.CommandTerm != term {
+			// leader changed maybe
+			DPrintf("[server=%-2d] execute fail, term out, op=%v", kv.me, op)
+			return false, ErrWrongLeader
+		}
+	case <-time.After(time.Second):
+		// leader changed maybe
+		DPrintf("[server=%-2d] execute fail, time out, op=%v", kv.me, op)
+		return false, ErrWrongLeader
+	}
+
+	DPrintf("[server=%-2d] execute end, op=%v", kv.me, op)
+	err = OK
+	return
 }
 
 //
@@ -97,6 +200,123 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
+	kv.kvStore = make(map[string]string)
+	kv.history = make(map[int64]uint32)
+	kv.noticeChan = make(map[int]chan raft.ApplyMsg)
+
+	// start bg
+	go kv.readApplyC(kv.applyCh)
 
 	return kv
+}
+
+func (kv *ShardKV) readApplyC(applyC <-chan raft.ApplyMsg) {
+
+	doNotify := func(index int, msg raft.ApplyMsg) {
+		// get index chan
+		kv.mu.Lock()
+		indexChan, ok := kv.noticeChan[index]
+		kv.mu.Unlock()
+
+		// notify
+		if ok {
+			DPrintf("[server=%-2d] apply msg=%v", kv.me, msg)
+			indexChan <- msg
+		}
+	}
+
+	for msg := range applyC {
+
+		if !msg.CommandValid {
+			continue
+		}
+
+		if msg.CommandIsSnapShot {
+			if data, ok := msg.Command.([]byte); ok {
+				kv.restoreSnapshot(data)
+			}
+			continue
+		}
+
+		if op, ok := msg.Command.(Op); ok {
+			sessionId := op.SessionId
+			requestId := op.RequestId
+			index 	  := msg.CommandIndex
+
+			// check req has applied
+			kv.mu.Lock()
+			hasApplied := kv.history[sessionId] >= requestId
+			kv.mu.Unlock()
+
+			// if has applied, notify and skip
+			if hasApplied {
+				doNotify(index, msg)
+				continue
+			}
+
+			// if has not applied, do apply and notify
+			kv.mu.Lock()
+			// apply log
+			switch op.Type {
+			case OpGet:
+				// do nothing
+			case OpPut:
+				kv.kvStore[op.Key] = op.Val
+			case OpAppend:
+				kv.kvStore[op.Key] += op.Val
+			}
+
+			// set req history
+			kv.history[sessionId] = requestId
+			kv.mu.Unlock()
+
+			// do notify
+			doNotify(index, msg)
+
+
+			if 0 < kv.maxraftstate && int(float32(kv.maxraftstate) * float32(0.5)) <= kv.rf.GetRaftStateSize() {
+				kv.saveSnapshot(index)
+			}
+		}
+	}
+}
+
+func (kv *ShardKV) saveSnapshot(index int) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.kvStore)
+	e.Encode(kv.history)
+	data := w.Bytes()
+
+	kv.rf.SaveSnapshot(index, data)
+}
+
+func (kv *ShardKV) restoreSnapshot(data []byte) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	if data == nil || len(data) < 1 {
+		// bootstrap without any state?
+		kv.kvStore = make(map[string]string)
+		return
+	}
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	if d.Decode(&kv.kvStore) != nil ||
+		d.Decode(&kv.history) != nil {
+		panic("readSnapshot decode error !")
+	}
+}
+
+const Debug = 1
+func DPrintf(format string, a ...interface{}) {
+	if Debug > 0 {
+		log.Printf(format, a...)
+	}
+	return
 }

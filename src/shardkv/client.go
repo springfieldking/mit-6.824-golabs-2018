@@ -8,7 +8,10 @@ package shardkv
 // talks to the group that holds the key's shard.
 //
 
-import "labrpc"
+import (
+	"labrpc"
+	"sync/atomic"
+)
 import "crypto/rand"
 import "math/big"
 import "shardmaster"
@@ -40,6 +43,10 @@ type Clerk struct {
 	config   shardmaster.Config
 	make_end func(string) *labrpc.ClientEnd
 	// You will have to modify this struct.
+
+	leader	  int
+	sessionId int64
+	requestId uint32
 }
 
 //
@@ -56,7 +63,14 @@ func MakeClerk(masters []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 	ck.sm = shardmaster.MakeClerk(masters)
 	ck.make_end = make_end
 	// You'll have to add code here.
+	ck.sessionId = nrand()
+	ck.requestId = 0
+	ck.leader = 0
 	return ck
+}
+
+func (ck *Clerk) nextSeqId() uint32 {
+	return atomic.AddUint32(&ck.requestId, 1)
 }
 
 //
@@ -66,7 +80,7 @@ func MakeClerk(masters []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 // You will have to modify this function.
 //
 func (ck *Clerk) Get(key string) string {
-	args := GetArgs{}
+	args := GetArgs{Key: key, SessionId: ck.sessionId, RequestId: ck.nextSeqId()}
 	args.Key = key
 
 	for {
@@ -99,7 +113,7 @@ func (ck *Clerk) Get(key string) string {
 // You will have to modify this function.
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	args := PutAppendArgs{}
+	args := PutAppendArgs{Key: key, Value: value, Op: op, SessionId: ck.sessionId, RequestId: ck.nextSeqId()}
 	args.Key = key
 	args.Value = value
 	args.Op = op
