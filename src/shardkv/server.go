@@ -1,11 +1,11 @@
 package shardkv
 
-
 // import "shardmaster"
 import (
 	"bytes"
 	"labrpc"
 	"log"
+	"shardmaster"
 	"time"
 )
 import "raft"
@@ -13,21 +13,21 @@ import "sync"
 import "labgob"
 
 const (
-	OpGet  		= "Get"
-	OpPut		= "Put"
-	OpAppend	= "Append"
+	OpGet    = "Get"
+	OpPut    = "Put"
+	OpAppend = "Append"
 )
 
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
-	SessionId 	int64
-	RequestId 	uint32
+	SessionId int64
+	RequestId uint32
 
-	Type	string
-	Key 	string
-	Val 	string
+	Type string
+	Key  string
+	Val  string
 }
 
 type ShardKV struct {
@@ -41,19 +41,22 @@ type ShardKV struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	kvStore  	map[string]string 	// current committed key-value pairs
-	history     map[int64]uint32 	// client session map to committed requestID
-	noticeChan 	map[int] chan raft.ApplyMsg
-}
+	kvStore    map[string]string // current committed key-value pairs
+	history    map[int64]uint32  // client session map to committed requestID
+	noticeChan map[int]chan raft.ApplyMsg
 
+	config    shardmaster.Config
+	mck       *shardmaster.Clerk
+	cfgTicker *time.Ticker
+}
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
 	isLeader, err := kv.exec(Op{
 		SessionId: args.SessionId,
 		RequestId: args.RequestId,
-		Type: OpGet,
-		Key: args.Key,
+		Type:      OpGet,
+		Key:       args.Key,
 	})
 
 	reply.WrongLeader = !isLeader
@@ -62,7 +65,8 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	// get value
 	if err == OK {
 		kv.mu.Lock()
-		v, ok := kv.kvStore[args.Key]; if ok {
+		v, ok := kv.kvStore[args.Key]
+		if ok {
 			reply.Value = v
 		}
 		kv.mu.Unlock()
@@ -74,11 +78,10 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	isLeader, err := kv.exec(Op{
 		SessionId: args.SessionId,
 		RequestId: args.RequestId,
-		Type: args.Op,
-		Val: args.Value,
-		Key: args.Key,
+		Type:      args.Op,
+		Val:       args.Value,
+		Key:       args.Key,
 	})
-
 
 	reply.WrongLeader = !isLeader
 	reply.Err = err
@@ -118,7 +121,6 @@ func (kv *ShardKV) exec(op Op) (isLeader bool, err Err) {
 		kv.mu.Unlock()
 	}()
 
-
 	// wait apply msg
 	var msg raft.ApplyMsg
 	select {
@@ -150,7 +152,6 @@ func (kv *ShardKV) Kill() {
 	kv.rf.Kill()
 	// Your code here, if desired.
 }
-
 
 //
 // servers[] contains the ports of the servers in this group.
@@ -193,10 +194,6 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.masters = masters
 
 	// Your initialization code here.
-
-	// Use something like this to talk to the shardmaster:
-	// kv.mck = shardmaster.MakeClerk(kv.masters)
-
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
@@ -204,13 +201,30 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.history = make(map[int64]uint32)
 	kv.noticeChan = make(map[int]chan raft.ApplyMsg)
 
-	// start bg
-	go kv.readApplyC(kv.applyCh)
+	// Use something like this to talk to the shardmaster:
+	// kv.mck = shardmaster.MakeClerk(kv.masters)
+	kv.mck = shardmaster.MakeClerk(kv.masters)
+	kv.cfgTicker = time.NewTicker(100 * time.Millisecond)
 
+	// start bg
+	go kv.readApplyCh(kv.applyCh)
+	go kv.tick()
 	return kv
 }
 
-func (kv *ShardKV) readApplyC(applyC <-chan raft.ApplyMsg) {
+func (kv *ShardKV) tick() {
+	select {
+	case <-kv.cfgTicker.C:
+		go kv.pullConfig()
+
+	}
+}
+
+func (kv *ShardKV) pullConfig() {
+	kv.config = kv.mck.Query(kv.config.Num + 1)
+}
+
+func (kv *ShardKV) readApplyCh(applyC <-chan raft.ApplyMsg) {
 
 	doNotify := func(index int, msg raft.ApplyMsg) {
 		// get index chan
@@ -241,7 +255,7 @@ func (kv *ShardKV) readApplyC(applyC <-chan raft.ApplyMsg) {
 		if op, ok := msg.Command.(Op); ok {
 			sessionId := op.SessionId
 			requestId := op.RequestId
-			index 	  := msg.CommandIndex
+			index := msg.CommandIndex
 
 			// check req has applied
 			kv.mu.Lock()
@@ -273,8 +287,7 @@ func (kv *ShardKV) readApplyC(applyC <-chan raft.ApplyMsg) {
 			// do notify
 			doNotify(index, msg)
 
-
-			if 0 < kv.maxraftstate && int(float32(kv.maxraftstate) * float32(0.5)) <= kv.rf.GetRaftStateSize() {
+			if 0 < kv.maxraftstate && int(float32(kv.maxraftstate)*float32(0.5)) <= kv.rf.GetRaftStateSize() {
 				kv.saveSnapshot(index)
 			}
 		}
@@ -314,6 +327,7 @@ func (kv *ShardKV) restoreSnapshot(data []byte) {
 }
 
 const Debug = 1
+
 func DPrintf(format string, a ...interface{}) {
 	if Debug > 0 {
 		log.Printf(format, a...)
