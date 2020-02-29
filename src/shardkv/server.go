@@ -13,11 +13,9 @@ import "sync"
 import "labgob"
 
 const (
-	CSOpGet    = "Get"
-	CSOpPut    = "Put"
-	CSOpAppend = "Append"
-
-	SSSyncCfg = "SyncCfg"
+	OpGet    = "Get"
+	OpPut    = "Put"
+	OpAppend = "Append"
 )
 
 type Op struct {
@@ -30,14 +28,6 @@ type Op struct {
 	Type string
 	Key  string
 	Val  string
-
-	Ext interface{}
-}
-
-type OpResult struct {
-	IsLeader 	bool
-	Err 		Err
-	applyMsg 	raft.ApplyMsg
 }
 
 type ShardKV struct {
@@ -53,7 +43,7 @@ type ShardKV struct {
 	// Your definitions here.
 	kvStore    map[string]string // current committed key-value pairs
 	history    map[int64]uint32  // client session map to committed requestID
-	noticeChan map[int]chan OpResult
+	noticeChan map[int]chan raft.ApplyMsg
 
 	config    shardmaster.Config
 	mck       *shardmaster.Clerk
@@ -62,18 +52,18 @@ type ShardKV struct {
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
-	ret := kv.exec(Op{
+	isLeader, err := kv.exec(Op{
 		SessionId: args.SessionId,
 		RequestId: args.RequestId,
-		Type:      CSOpGet,
+		Type:      OpGet,
 		Key:       args.Key,
 	})
 
-	reply.WrongLeader = !ret.IsLeader
-	reply.Err = ret.Err
+	reply.WrongLeader = !isLeader
+	reply.Err = err
 
 	// get value
-	if ret.Err == OK {
+	if err == OK {
 		kv.mu.Lock()
 		v, ok := kv.kvStore[args.Key]
 		if ok {
@@ -85,7 +75,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
-	ret := kv.exec(Op{
+	isLeader, err := kv.exec(Op{
 		SessionId: args.SessionId,
 		RequestId: args.RequestId,
 		Type:      args.Op,
@@ -93,11 +83,11 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		Key:       args.Key,
 	})
 
-	reply.WrongLeader = !ret.IsLeader
-	reply.Err = ret.Err
+	reply.WrongLeader = !isLeader
+	reply.Err = err
 }
 
-func (kv *ShardKV) exec(op Op) OpResult {
+func (kv *ShardKV) exec(op Op) (isLeader bool, err Err) {
 	// Your code here.
 	kv.mu.Lock()
 
@@ -105,17 +95,20 @@ func (kv *ShardKV) exec(op Op) OpResult {
 	if kv.history[op.SessionId] >= op.RequestId {
 		kv.mu.Unlock()
 		DPrintf("[server=%-2d] repeated call return %v", kv.me, op)
-		return OpResult{IsLeader: true, Err: OK}
+		return true, OK
 	}
 
-	index, term, isLeader := kv.rf.Start(op)
+	var index, term int
+
+	index, term, isLeader = kv.rf.Start(op)
 	if !isLeader {
+		err = ErrWrongLeader
 		kv.mu.Unlock()
-		return OpResult{IsLeader: false, Err: ErrWrongLeader}
+		return
 	}
 
 	// create index chan for wait
-	noticeCh := make(chan OpResult)
+	noticeCh := make(chan raft.ApplyMsg)
 	kv.noticeChan[index] = noticeCh
 	kv.mu.Unlock()
 
@@ -129,24 +122,24 @@ func (kv *ShardKV) exec(op Op) OpResult {
 	}()
 
 	// wait apply msg
-	var opRet OpResult
+	var msg raft.ApplyMsg
 	select {
-	case opRet = <-noticeCh:
+	case msg = <-noticeCh:
 		// check term
-		if opRet.applyMsg.CommandTerm != term {
+		if msg.CommandTerm != term {
 			// leader changed maybe
 			DPrintf("[server=%-2d] execute fail, term out, op=%v", kv.me, op)
-			return OpResult{IsLeader: false, Err: ErrWrongLeader}
+			return false, ErrWrongLeader
 		}
 	case <-time.After(time.Second):
 		// leader changed maybe
 		DPrintf("[server=%-2d] execute fail, time out, op=%v", kv.me, op)
-		return OpResult{IsLeader: false, Err: ErrWrongLeader}
+		return false, ErrWrongLeader
 	}
 
 	DPrintf("[server=%-2d] execute end, op=%v", kv.me, op)
-	opRet.IsLeader = true
-	return OpResult{IsLeader: false, Err: OK}
+	err = OK
+	return
 }
 
 //
@@ -206,7 +199,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 
 	kv.kvStore = make(map[string]string)
 	kv.history = make(map[int64]uint32)
-	kv.noticeChan = make(map[int]chan OpResult)
+	kv.noticeChan = make(map[int]chan raft.ApplyMsg)
 
 	// Use something like this to talk to the shardmaster:
 	// kv.mck = shardmaster.MakeClerk(kv.masters)
@@ -228,18 +221,12 @@ func (kv *ShardKV) tick() {
 }
 
 func (kv *ShardKV) pullConfig() {
-	if _, isLeader := kv.rf.GetState(); isLeader {
-		var config = kv.mck.Query(kv.config.Num + 1)
-		kv.exec(Op{
-			Type: SSSyncCfg,
-			Ext:  config,
-		})
-	}
+	kv.config = kv.mck.Query(kv.config.Num + 1)
 }
 
 func (kv *ShardKV) readApplyCh(applyC <-chan raft.ApplyMsg) {
 
-	doNotify := func(index int, opRet OpResult) {
+	doNotify := func(index int, msg raft.ApplyMsg) {
 		// get index chan
 		kv.mu.Lock()
 		indexChan, ok := kv.noticeChan[index]
@@ -247,8 +234,8 @@ func (kv *ShardKV) readApplyCh(applyC <-chan raft.ApplyMsg) {
 
 		// notify
 		if ok {
-			DPrintf("[server=%-2d] apply opRet=%v", kv.me, opRet)
-			indexChan <- opRet
+			DPrintf("[server=%-2d] apply msg=%v", kv.me, msg)
+			indexChan <- msg
 		}
 	}
 
@@ -271,54 +258,26 @@ func (kv *ShardKV) readApplyCh(applyC <-chan raft.ApplyMsg) {
 			index := msg.CommandIndex
 
 			// check req has applied
-			// sessionId 0 mean server req, so no need check
-			var hasApplied = false
-			if sessionId > 0 {
-				kv.mu.Lock()
-				hasApplied = kv.history[sessionId] >= requestId
-				kv.mu.Unlock()
-			}
+			kv.mu.Lock()
+			hasApplied := kv.history[sessionId] >= requestId
+			kv.mu.Unlock()
 
 			// if has applied, notify and skip
 			if hasApplied {
-				doNotify(index, OpResult{IsLeader:true, Err:OK, applyMsg:msg})
+				doNotify(index, msg)
 				continue
-			}
-
-			checkShard := func(key string) (err Err) {
-				err = "OK"
-				shard := key2shard(op.Key)
-				if kv.config.Shards[shard] != kv.gid {
-					//err = ErrWrongGroup
-				}
-				return
 			}
 
 			// if has not applied, do apply and notify
 			kv.mu.Lock()
 			// apply log
-			var err Err = OK
 			switch op.Type {
-			case CSOpGet: {
-				err = checkShard(op.Key)
-			}
-			case CSOpPut: {
-				err = checkShard(op.Key)
-				if err == OK {
-					kv.kvStore[op.Key] = op.Val
-				}
-			}
-			case CSOpAppend: {
-				err = checkShard(op.Key)
-				if err == OK {
-					kv.kvStore[op.Key] += op.Val
-				}
-			}
-			case SSSyncCfg: {
-				if cfg, ok := op.Ext.(shardmaster.Config); ok {
-					kv.config = cfg
-				}
-			}
+			case OpGet:
+				// do nothing
+			case OpPut:
+				kv.kvStore[op.Key] = op.Val
+			case OpAppend:
+				kv.kvStore[op.Key] += op.Val
 			}
 
 			// set req history
@@ -326,7 +285,7 @@ func (kv *ShardKV) readApplyCh(applyC <-chan raft.ApplyMsg) {
 			kv.mu.Unlock()
 
 			// do notify
-			doNotify(index, OpResult{IsLeader:true, Err:err, applyMsg:msg})
+			doNotify(index, msg)
 
 			if 0 < kv.maxraftstate && int(float32(kv.maxraftstate)*float32(0.5)) <= kv.rf.GetRaftStateSize() {
 				kv.saveSnapshot(index)

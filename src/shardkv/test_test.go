@@ -1,9 +1,6 @@
 package shardkv
 
-import (
-	"linearizability"
-	"log"
-)
+import "linearizability"
 
 import "testing"
 import "strconv"
@@ -18,7 +15,6 @@ const linearizabilityCheckTimeout = 1 * time.Second
 func check(t *testing.T, ck *Clerk, key string, value string) {
 	v := ck.Get(key)
 	if v != value {
-		log.Panicf("Get(%v): expected:\n%v\nreceived:\n%v", key, value, v)
 		t.Fatalf("Get(%v): expected:\n%v\nreceived:\n%v", key, value, v)
 	}
 }
