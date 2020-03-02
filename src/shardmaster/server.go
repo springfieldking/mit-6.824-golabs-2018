@@ -440,7 +440,7 @@ func (sm *ShardMaster) restoreSnapshot(data []byte) {
 }
 
 
-const Debug = 1
+const Debug = 0
 func DPrintf(format string, a ...interface{}) {
 	if Debug > 0 {
 		log.Printf(format, a...)

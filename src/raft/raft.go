@@ -766,6 +766,7 @@ func (rf *Raft) resetTimer()  {
 }
 
 func (rf *Raft) becomeFollower()  {
+	DPrintf("[raft=%-2d state=%-1d term=%-2d] become(StateFollower)!", rf.me, rf.currState, rf.currentTerm)
 	rf.resetTimer()
 }
 
@@ -782,6 +783,7 @@ func (rf *Raft) stepFollower(event Event)  {
 }
 
 func (rf *Raft) becomeCandidate()  {
+	DPrintf("[raft=%-2d state=%-1d term=%-2d] become(StateCandidate)!", rf.me, rf.currState, rf.currentTerm)
 	// increment currentTerm
 	rf.currentTerm ++
 	// vote for self
@@ -810,7 +812,7 @@ func (rf *Raft) stepCandidate(event Event)  {
 func (rf *Raft) becomeLeader()  {
 	// reset timer
 	rf.resetTimer();
-
+	DPrintf("[raft=%-2d state=%-1d term=%-2d] become(StateLeader)!", rf.me, rf.currState, rf.currentTerm)
 	// Reinitialized after election
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))

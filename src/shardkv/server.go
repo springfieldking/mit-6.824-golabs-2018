@@ -30,6 +30,12 @@ type Op struct {
 	Val  string
 }
 
+type ApplyRet struct {
+	Err Err
+	Val string
+	ApplyMsg raft.ApplyMsg
+}
+
 type ShardKV struct {
 	mu           sync.Mutex
 	me           int
@@ -43,7 +49,7 @@ type ShardKV struct {
 	// Your definitions here.
 	kvStore    map[string]string // current committed key-value pairs
 	history    map[int64]uint32  // client session map to committed requestID
-	noticeChan map[int]chan raft.ApplyMsg
+	noticeChan map[int]chan ApplyRet
 
 	config    shardmaster.Config
 	mck       *shardmaster.Clerk
@@ -51,31 +57,21 @@ type ShardKV struct {
 }
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
-	isLeader, err := kv.exec(Op{
+	op := &Op{
 		SessionId: args.SessionId,
 		RequestId: args.RequestId,
 		Type:      OpGet,
 		Key:       args.Key,
-	})
-
+	}
+	isLeader, err := kv.exec(op)
 	reply.WrongLeader = !isLeader
 	reply.Err = err
-
-	// get value
-	if err == OK {
-		kv.mu.Lock()
-		v, ok := kv.kvStore[args.Key]
-		if ok {
-			reply.Value = v
-		}
-		kv.mu.Unlock()
-	}
+	reply.Value = op.Val
 }
 
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
-	isLeader, err := kv.exec(Op{
+	isLeader, err := kv.exec(&Op{
 		SessionId: args.SessionId,
 		RequestId: args.RequestId,
 		Type:      args.Op,
@@ -87,20 +83,22 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	reply.Err = err
 }
 
-func (kv *ShardKV) exec(op Op) (isLeader bool, err Err) {
+func (kv *ShardKV) exec(op *Op) (isLeader bool, err Err) {
 	// Your code here.
 	kv.mu.Lock()
 
 	// check req
+	/*
 	if kv.history[op.SessionId] >= op.RequestId {
 		kv.mu.Unlock()
-		DPrintf("[server=%-2d] repeated call return %v", kv.me, op)
+		DPrintf("[server=%-2d] repeated call return %v", kv.me, *op)
 		return true, OK
 	}
+	*/
 
 	var index, term int
 
-	index, term, isLeader = kv.rf.Start(op)
+	index, term, isLeader = kv.rf.Start(*op)
 	if !isLeader {
 		err = ErrWrongLeader
 		kv.mu.Unlock()
@@ -108,11 +106,11 @@ func (kv *ShardKV) exec(op Op) (isLeader bool, err Err) {
 	}
 
 	// create index chan for wait
-	noticeCh := make(chan raft.ApplyMsg)
+	noticeCh := make(chan ApplyRet)
 	kv.noticeChan[index] = noticeCh
 	kv.mu.Unlock()
 
-	defer DPrintf("[server=%-2d] exec op=%v index=%v term=%v", kv.me, op, index, term)
+	defer DPrintf("[server=%-2d] exec op=%v index=%v term=%v", kv.me, *op, index, term)
 
 	// destroy chan before return
 	defer func() {
@@ -122,23 +120,24 @@ func (kv *ShardKV) exec(op Op) (isLeader bool, err Err) {
 	}()
 
 	// wait apply msg
-	var msg raft.ApplyMsg
+	var ret ApplyRet
 	select {
-	case msg = <-noticeCh:
+	case ret = <-noticeCh:
 		// check term
-		if msg.CommandTerm != term {
+		if ret.ApplyMsg.CommandTerm != term {
 			// leader changed maybe
-			DPrintf("[server=%-2d] execute fail, term out, op=%v", kv.me, op)
+			DPrintf("[server=%-2d] execute fail, term out, op=%v", kv.me, *op)
 			return false, ErrWrongLeader
 		}
 	case <-time.After(time.Second):
 		// leader changed maybe
-		DPrintf("[server=%-2d] execute fail, time out, op=%v", kv.me, op)
+		DPrintf("[server=%-2d] execute fail, time out, op=%v", kv.me, *op)
 		return false, ErrWrongLeader
 	}
 
-	DPrintf("[server=%-2d] execute end, op=%v", kv.me, op)
-	err = OK
+	DPrintf("[server=%-2d] execute end, op=%v", kv.me, *op)
+	err = ret.Err
+	op.Val = ret.Val
 	return
 }
 
@@ -185,6 +184,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
 	labgob.Register(Op{})
+	labgob.Register(shardmaster.Config{})
 
 	kv := new(ShardKV)
 	kv.me = me
@@ -199,34 +199,42 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 
 	kv.kvStore = make(map[string]string)
 	kv.history = make(map[int64]uint32)
-	kv.noticeChan = make(map[int]chan raft.ApplyMsg)
+	kv.noticeChan = make(map[int]chan ApplyRet)
 
 	// Use something like this to talk to the shardmaster:
 	// kv.mck = shardmaster.MakeClerk(kv.masters)
 	kv.mck = shardmaster.MakeClerk(kv.masters)
-	kv.cfgTicker = time.NewTicker(100 * time.Millisecond)
+	kv.cfgTicker = time.NewTicker(50 * time.Millisecond)
 
 	// start bg
-	go kv.readApplyCh(kv.applyCh)
 	go kv.tick()
+	go kv.readApplyCh()
 	return kv
 }
 
 func (kv *ShardKV) tick() {
-	select {
-	case <-kv.cfgTicker.C:
-		go kv.pullConfig()
 
+	// exec before tick
+	kv.fetchConfig()
+
+	for {
+		select {
+		case <-kv.cfgTicker.C:
+			go kv.fetchConfig()
+		}
 	}
 }
 
-func (kv *ShardKV) pullConfig() {
-	kv.config = kv.mck.Query(kv.config.Num + 1)
+func (kv *ShardKV) fetchConfig() {
+	if _, isLeader := kv.rf.GetState();!isLeader{return}
+	DPrintf("[server=%-2d] configFetch config num=%v", kv.me, kv.config.Num + 1)
+	var config = kv.mck.Query(kv.config.Num + 1)
+	kv.rf.Start(config)
 }
 
-func (kv *ShardKV) readApplyCh(applyC <-chan raft.ApplyMsg) {
+func (kv *ShardKV) readApplyCh() {
 
-	doNotify := func(index int, msg raft.ApplyMsg) {
+	doNotify := func(index int, msg ApplyRet) {
 		// get index chan
 		kv.mu.Lock()
 		indexChan, ok := kv.noticeChan[index]
@@ -234,12 +242,12 @@ func (kv *ShardKV) readApplyCh(applyC <-chan raft.ApplyMsg) {
 
 		// notify
 		if ok {
-			DPrintf("[server=%-2d] apply msg=%v", kv.me, msg)
+			DPrintf("[server=%-2d] apply ret=%v", kv.me, msg)
 			indexChan <- msg
 		}
 	}
 
-	for msg := range applyC {
+	for msg := range kv.applyCh {
 
 		if !msg.CommandValid {
 			continue
@@ -258,26 +266,35 @@ func (kv *ShardKV) readApplyCh(applyC <-chan raft.ApplyMsg) {
 			index := msg.CommandIndex
 
 			// check req has applied
+			var val = ""
 			kv.mu.Lock()
 			hasApplied := kv.history[sessionId] >= requestId
+			if op.Type == OpGet {val = kv.kvStore[op.Key]}
 			kv.mu.Unlock()
 
 			// if has applied, notify and skip
 			if hasApplied {
-				doNotify(index, msg)
+				doNotify(index, ApplyRet{Err:OK, Val:val, ApplyMsg:msg})
 				continue
 			}
 
 			// if has not applied, do apply and notify
 			kv.mu.Lock()
-			// apply log
-			switch op.Type {
-			case OpGet:
-				// do nothing
-			case OpPut:
-				kv.kvStore[op.Key] = op.Val
-			case OpAppend:
-				kv.kvStore[op.Key] += op.Val
+			var err Err
+			if shard := key2shard(op.Key); kv.config.Shards[shard] == kv.gid {
+				// apply log
+				switch op.Type {
+				case OpGet:
+					val = kv.kvStore[op.Key]
+				case OpPut:
+					kv.kvStore[op.Key] = op.Val
+				case OpAppend:
+					kv.kvStore[op.Key] += op.Val
+				}
+				err = OK
+			} else {
+				//err = ErrWrongGroup
+				DPrintf("[server=%-2d] apply ErrWrongGroup gid=%v shard=%v", kv.me, kv.gid, kv.config.Shards)
 			}
 
 			// set req history
@@ -285,11 +302,17 @@ func (kv *ShardKV) readApplyCh(applyC <-chan raft.ApplyMsg) {
 			kv.mu.Unlock()
 
 			// do notify
-			doNotify(index, msg)
+			doNotify(index, ApplyRet{Err:err, Val:val, ApplyMsg:msg})
 
 			if 0 < kv.maxraftstate && int(float32(kv.maxraftstate)*float32(0.5)) <= kv.rf.GetRaftStateSize() {
 				kv.saveSnapshot(index)
 			}
+		} else if config, ok := msg.Command.(shardmaster.Config); ok {
+			kv.mu.Lock()
+			kv.config = config
+			kv.mu.Unlock()
+
+			DPrintf("[server=%-2d] configApply config=%v", kv.me, config)
 		}
 	}
 }
